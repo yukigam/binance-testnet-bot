@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# Secrets - NEVER commit these
+# ---------------------------------------------------------------------------
+# .env holds your API keys and the Telegram bot token. Only .env.example
+# (which is safe and contains no credentials) belongs in the repository.
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Runtime artefacts
+# ---------------------------------------------------------------------------
+*.log
+bot.log
+bot_live.log
+bot_live.err
+bot_long_run.log
+bot_long_run.err
+*.pid
+telegram_retry_spool.jsonl
+telegram_retry_spool.jsonl.tmp
+
+# Local notes that contain credentials (kept on disk, never pushed).
+binance-bot.txt
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/

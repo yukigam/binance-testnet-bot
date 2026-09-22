@@ -1,0 +1,8 @@
+# Binance Spot Testnet trading bot - Python dependencies
+# Requires Python 3.9+ (the --async entry point uses asyncio worker threads).
+# Install them with:  pip install -r requirements.txt
+
+ccxt>=4.0.0           # unified crypto-exchange library (connects to Binance Testnet)
+pandas>=2.0.0         # technical indicators (EMA, RSI, ADX)
+python-dotenv>=1.0.0  # loads API keys from the .env file
+requests>=2.31.0      # Telegram Bot API notifications (HTTP POST)
