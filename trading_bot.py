@@ -2668,10 +2668,10 @@ def main(use_async: bool = None) -> int:
     """
     if use_async is None:
         use_async = any(arg in ("--async", "--asyncio") for arg in sys.argv[1:])
+    cfg = load_config()
     use_scan = (cfg["scan_enabled"]
                 or any(arg in ("--scan", "--multi", "--all-pairs")
                        for arg in sys.argv[1:]))
-    cfg = load_config()
     setup_logging(cfg["log_level"])
     log = logging.getLogger("bot")
 
