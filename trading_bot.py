@@ -92,6 +92,7 @@ import random
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import ccxt
 import pandas as pd
@@ -241,6 +242,44 @@ def load_config() -> dict:
         # production so a 24/7 bot can never shut itself down (0 = off).
         "run_for_seconds": max(0, int(os.getenv("RUN_FOR_SECONDS", "0"))),
         "log_level": os.getenv("LOG_LEVEL", "INFO").strip().upper(),
+        # --- Multi-coin scanner (async, dynamic symbol discovery) --------------
+        # Master switch: when true the bot becomes a portfolio scanner instead of
+        # trading a single SYMBOL. It discovers every active spot pair quoted in
+        # SCAN_QUOTE (default USDT) on the exchange, filters/caps the universe and
+        # trades each pair with a *proportional* slice of the free USDT balance.
+        "scan_enabled": os.getenv("SCAN_ENABLED", "false").strip().lower() == "true",
+        # Quote currency all discovered pairs share (e.g. USDT).
+        "scan_quote": os.getenv("SCAN_QUOTE", "USDT").strip().upper() or "USDT",
+        # How many parts the free balance is split into - the reference video
+        # divides the balance into 21 slots. Each part becomes the per-pair budget
+        # (auto-shrunk so a part can still clear minNotional on a small account).
+        "portfolio_parts": max(1, int(os.getenv("PORTFOLIO_PARTS", "21"))),
+        # Absolute floor (USDT) per budget slot so a $10 account still respects
+        # Binance's minNotional instead of trying to trade a few cents per pair.
+        "portfolio_floor_usdt": float(os.getenv("PORTFOLIO_FLOOR_USDT", "0")),
+        # Only scan spot pairs that traded at least this much quote in 24h -- a
+        # cheap "high-volume" filter that also skips illiquid garbage pairs.
+        "scan_min_24h_quote": float(os.getenv("SCAN_MIN_24H_QUOTE", "100000")),
+        # Hard cap on the number of pairs scanned/traded per cycle (0 = no cap).
+        "scan_max_symbols": int(os.getenv("SCAN_MAX_SYMBOLS", "30")),
+        # Comma-separated symbols never to touch (e.g. "SHIBUSDT,DOGEUSDT").
+        "scan_exclude": [s.strip().upper() for s in
+                         os.getenv("SCAN_EXCLUDE", "").split(",") if s.strip()],
+        # Optional explicit universe: "SYM1/USDT,SYM2/USDT". When set it wins over
+        # the automatic high-volume discovery (empty = discover dynamically).
+        "scanner_symbols": os.getenv("SCANNER_SYMBOLS", "").strip(),
+        # Trailing stop: while the price rises the hard stop-loss is dragged up
+        # behind it, locking in profit, and the position closes when price drops
+        # this many % from its post-entry peak. 0 = classic fixed stop only.
+        "trailing_stop_pct": float(os.getenv("TRAILING_STOP_PCT", "0")),
+        # Binance BNB-fee-discount (0..25%). Holding BNB cuts the taker fee by up
+        # to 25%; this is reflected in the effective fee used for sizing & R:R.
+        "bnb_fee_discount_pct": float(os.getenv("BNB_FEE_DISCOUNT_PCT", "0")),
+        # Max share of the free USDT balance that may be deployed across the whole
+        # portfolio at once (%), leaving a reserve for fees and future entries.
+        "use_all_balance_pct": float(os.getenv("USE_ALL_BALANCE_PCT", "100")),
+        # Poll interval (seconds) between scanner cycles (independent of POLL_SECONDS).
+        "scan_poll_seconds": int(os.getenv("SCAN_POLL_SECONDS", "60")),
     }
 
 
@@ -1009,6 +1048,134 @@ def plan_market_buy(price: float, quote_free: float, *, order_size_quote: float,
 
 
 # ------------------------------------------------------------------------------
+# Multi-coin / proportional sizing helpers
+# ------------------------------------------------------------------------------
+def effective_fee_rate(base_fee_rate: float, bnb_discount_pct: float = 0.0) -> float:
+    """
+    Binance BNB-fee-discount: holding BNB cuts the taker fee by up to 25%.
+
+    `bnb_discount_pct` is the discount in % (0..25). The result is the fee
+    fraction actually charged, used by the scanner for sizing and R:R so the
+    numbers match an account that pays with BNB.
+    """
+    base = max(0.0, float(base_fee_rate or 0.0))
+    discount = max(0.0, min(25.0, float(bnb_discount_pct or 0.0))) / 100.0
+    return base * (1.0 - discount)
+
+
+def compute_proportional_budget(total_balance_usdt: float, parts: int = 21,
+                                floor_usdt: float = 0.0, min_cost: float = 0.0,
+                                buffer_pct: float = 0.0) -> dict:
+    """
+    Split the free USDT balance into `parts` equal position budgets.
+
+    This is the "divide the account into 21 parts" rule from the reference
+    video, made safe for small accounts ($10 .. $50+). If one full part would
+    fall below the pair's tradeable floor (the largest of `floor_usdt` and
+    minNotional `min_cost * (1 + buffer)`), the number of parts is auto-shrunk
+    so every part still clears that floor - a $10 account therefore trades one
+    properly-sized slot instead of 21 dust orders Binance would reject.
+
+    Returns a dict: per_part, parts (requested), usable_parts, active_budget
+    (usable_parts * per_part, i.e. the USDT actually deployable), floor.
+    """
+    total = max(0.0, float(total_balance_usdt or 0.0))
+    requested = max(1, int(parts or 1))
+    floor = max(0.0, float(floor_usdt or 0.0))
+    if min_cost and min_cost > 0:
+        floor = max(floor, float(min_cost) * (1.0 + max(0.0, buffer_pct) / 100.0))
+    if total <= 0:
+        return {"per_part": 0.0, "parts": requested, "usable_parts": 0,
+                "active_budget": 0.0, "floor": floor}
+
+    usable = requested
+    if floor > 0 and (total / usable) < floor:
+        # Auto-shrink to the largest count whose slot still clears the floor.
+        usable = max(1, int(total // floor)) if floor > 0 else requested
+        usable = min(usable, requested)
+    per_part = total / usable
+    if floor > 0 and per_part < floor:   # e.g. floor > the whole balance
+        per_part, usable = floor, 1
+    return {"per_part": per_part, "parts": requested, "usable_parts": usable,
+            "active_budget": per_part * usable, "floor": floor}
+
+
+def trailing_stop_level(entry_price: float, highest_price: float,
+                        trail_pct: float) -> float:
+    """
+    Current trailing-stop price: `trail_pct` below the post-entry peak
+    (>= entry). 0 when the peak is unknown.
+    """
+    trail = max(0.0, float(trail_pct or 0.0))
+    if not entry_price or entry_price <= 0:
+        return 0.0
+    peak = max(float(entry_price), float(highest_price or entry_price))
+    if trail <= 0:
+        return 0.0
+    return peak * (1.0 - trail / 100.0)
+
+
+def trailing_stop_hit(entry_price: float, highest_price: float,
+                      current_price: float, trail_pct: float) -> bool:
+    """
+    True once current_price has dropped `trail_pct` below its post-entry peak.
+
+    A trailing stop is a *profit-locking* risk rule: while the price rises the
+    tight stop-loss is dragged up behind it, so a pullback that reaches the
+    running peak minus trail_pct closes the position instead of giving back the
+    whole win. Returns False when there is nothing to trail (< initial entry).
+    """
+    trail = max(0.0, float(trail_pct or 0.0))
+    if trail <= 0:
+        return False
+    if not current_price or current_price <= 0 or not entry_price or entry_price <= 0:
+        return False
+    level = trailing_stop_level(entry_price, highest_price, trail_pct)
+    return level > 0 and current_price <= level
+
+
+def discover_spot_usdt_symbols(markets, quote: str = "USDT",
+                               min_24h_quote: float = 100000.0,
+                               exclude=(), max_symbols: int = 0) -> list:
+    """
+    Discover the dynamic scan universe from ccxt `load_markets()` output.
+
+    `markets` is a dict {symbol: market} (as returned by ccxt.load_markets) so
+    this stays a pure, unit-testable function - pass the real dict in live mode
+    or a hand-built one in the smoke test.
+
+    Returns spot pairs quoted in `quote`, sorted by 24h quote volume descending,
+    optionally filtered to pairs traded at least `min_24h_quote` in 24h and the
+    `exclude` set, and capped to `max_symbols` (0 = no cap).
+    """
+    q = (quote or "USDT").upper()
+    suffix = "/" + q
+    rows = []
+    for symbol, market in (markets or {}).items():
+        if not isinstance(symbol, str) or not symbol.endswith(suffix):
+            continue
+        mtype = (market or {}).get("type")
+        if mtype not in (None, "spot", ""):
+            continue
+        up = symbol.upper()
+        if up in {e.upper() for e in exclude}:
+            continue
+        info = (market or {}).get("info") or {}
+        stats = (market or {}).get("stats") or {}
+        # ccxt exposes 24h volume in several shapes; prefer the quote volume.
+        volume24 = float(stats.get("quoteVolume") or stats.get("quoteVolume24h")
+                         or info.get("quoteVolume") or 0.0)
+        rows.append((volume24, up))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    if min_24h_quote and min_24h_quote > 0:
+        rows = [r for r in rows if r[0] >= float(min_24h_quote)]
+    symbols = [r[1] for r in rows]
+    if max_symbols and max_symbols > 0:
+        symbols = symbols[:max_symbols]
+    return symbols
+
+
+# ------------------------------------------------------------------------------
 # The bot
 # ------------------------------------------------------------------------------
 class BinanceTestnetBot:
@@ -1028,6 +1195,13 @@ class BinanceTestnetBot:
         # _init_live() replaces it with the pair's real taker fee when ccxt
         # reports one, so the net R:R report matches the account.
         self.fee_rate = max(0.0, float(cfg.get("fee_rate", 0.001) or 0.0))
+        # BNB-fee-discount (0..25%): holding BNB cuts the taker fee, which shrinks
+        # the effective per-trade cost used for sizing and the R:R report.
+        self.bnb_discount_pct = max(0.0, min(25.0,
+                                             float(cfg.get("bnb_fee_discount_pct", 0.0) or 0.0)))
+        self.fee_rate = effective_fee_rate(self.fee_rate, self.bnb_discount_pct)
+        # Trailing-stop distance (%). 0 = classic fixed stop-loss only.
+        self.trailing_stop_pct = max(0.0, float(cfg.get("trailing_stop_pct", 0.0) or 0.0))
         self.last_signal_candle = None   # avoid re-trading the same candle
         self.failures = 0                # for exponential backoff
         self.avg_entry_price = None      # last BUY fill price (for Telegram P/L)
@@ -1096,7 +1270,7 @@ class BinanceTestnetBot:
         try:
             taker = (self.exchange.market(self.cfg["symbol"]) or {}).get("taker")
             if taker:
-                self.fee_rate = max(0.0, float(taker))
+                self.fee_rate = effective_fee_rate(float(taker), self.bnb_discount_pct)
         except (TypeError, ValueError):
             pass
         self.log.info(
@@ -1539,6 +1713,7 @@ class BinanceTestnetBot:
             "planned_rr": rr["rr"],
             "sl_exit_notional": plan["sl_exit_notional"],
             "exit_notional_ok": plan["exit_notional_ok"],
+            "trail_peak": price,               # highest price since entry (trailing stop)
         }
 
         if self.exchange is None:  # demo
@@ -1779,10 +1954,25 @@ class BinanceTestnetBot:
             tp_sl_hit = None
             if in_position and self.avg_entry_price and self.avg_entry_price > 0:
                 tp_sl_hit = self._tp_sl_exit_reason(price)
+                if self.trailing_stop_pct > 0 and tp_sl_hit is None:
+                    # Trailing stop: drag the stop up behind a rising peak and lock
+                    # in profit on a pullback from that peak (only when the fixed
+                    # TP/SL has not already fired).
+                    prev_peak = float((self.position or {}).get("trail_peak")
+                                      or self.avg_entry_price)
+                    self.position["trail_peak"] = max(prev_peak, price)
+                    if trailing_stop_hit(self.avg_entry_price, prev_peak, price,
+                                         self.trailing_stop_pct):
+                        level = trailing_stop_level(
+                            self.avg_entry_price, max(prev_peak, price),
+                            self.trailing_stop_pct)
+                        tp_sl_hit = (f"TRAILING-STOP -{self.trailing_stop_pct:g}% hit "
+                                     f"(peak {max(prev_peak, price):,.2f} -> "
+                                     f"stop {level:,.2f})")
 
             if tp_sl_hit:
                 self.log.info("%s -> closing position @ %.2f", tp_sl_hit, price)
-                was_stop = tp_sl_hit.startswith("STOP-LOSS")
+                was_stop = tp_sl_hit.startswith("STOP-LOSS") or tp_sl_hit.startswith("TRAILING-STOP")
                 self.place_sell(price, base_free, reason=tp_sl_hit)
                 self.last_signal_candle = candle_ts  # don't also re-act this candle
                 if was_stop:
@@ -1954,6 +2144,497 @@ class BinanceTestnetBot:
 
 
 # ------------------------------------------------------------------------------
+# Multi-coin / all-pairs portfolio scanner
+# ------------------------------------------------------------------------------
+class MultiCoinScanner:
+    """
+    Dynamically scans and trades a whole universe of spot pairs in parallel.
+
+    Instead of trading one SYMBOL, the scanner:
+
+      1. discovers every active spot pair quoted in SCAN_QUOTE (default USDT)
+         from ccxt's load_markets(), optionally filtered to high 24h volume,
+         minus SCAN_EXCLUDE and capped to SCAN_MAX_SYMBOLS - or uses an explicit
+         SCANNER_SYMBOLS list;
+      2. sizes every entry *proportionally*: the free USDT balance is split
+         into PORTFOLIO_PARTS equal budgets (the "21 parts" rule from the
+         reference video), each part is floored to the pair's minNotional so a
+         small ($10 .. $50+) account still places real, exit-viable orders;
+      3. applies the same EMA + ADX(>=25) trend filter as the single-symbol bot,
+         plus a hard Take-Profit, a Stop-Loss and an optional Trailing-Stop per
+         open position;
+      4. refreshes per-symbol price/candle data in parallel using a thread pool,
+         so scanning 20+ pairs never serialises into one long blocking crawl.
+
+    The blocking ccxt / Telegram work always happens in worker threads, so both
+    the classic `run()` loop and the asyncio `run_async()` twin keep the event
+    loop responsive while scanning many pairs -- the asyncio twin uses
+    `loop.run_in_executor` exactly like the single-symbol bot does.
+
+    DEMO_MODE=true runs the exact same loop on synthetic data with a simulated
+    balance, so the scanner can be tested offline without API keys.
+    """
+
+    def __init__(self, cfg: dict, exchange=None):
+        self.cfg = cfg
+        self.log = logging.getLogger("scanner")
+        self.exchange = exchange            # injectable for tests; None = demo
+        self.lock = threading.RLock()       # guards positions + balances
+        self.positions = {}                 # symbol -> open position dict
+        self.closed_trades = []
+        self.trade_counter = 0
+        self.symbol_rules = {}              # symbol -> (min_qty, min_cost, step)
+        self.symbols = []                   # the resolved scan universe
+        self.paper_usdt = max(0.0, float(cfg.get("initial_balance_usdt", 10.0) or 0.0))
+        self.paper_base = {}                # demo: symbol -> base free balance
+        self.demo_dfs = {}                  # demo: symbol -> synthetic candle df
+        self.failures = 0
+        self.last_signal_candle = {}        # symbol -> last acted-upon candle ts
+        self.tg = TelegramNotifier(
+            cfg.get("telegram_bot_token", ""), cfg.get("telegram_chat_id", ""), self.log,
+            max_attempts=cfg.get("telegram_max_attempts", 3),
+            retry_delays=cfg.get("telegram_retry_delays", (2.0, 4.0)),
+            queue_retry_seconds=cfg.get("telegram_queue_retry_seconds", 30.0),
+            queue_max_age=cfg.get("telegram_queue_max_age", 1800.0),
+        )
+        self.bnb_discount_pct = max(0.0, min(
+            25.0, float(cfg.get("bnb_fee_discount_pct", 0.0) or 0.0)))
+        # Portfolio sizing knots (pulled from cfg with sensible defaults).
+        self.quote = (cfg.get("scan_quote") or "USDT").upper()
+        self.parts = max(1, int(cfg.get("portfolio_parts", 21) or 21))
+        self.floor_usdt = max(0.0, float(cfg.get("portfolio_floor_usdt", 0.0) or 0.0))
+        self.min_24h_quote = max(0.0, float(cfg.get("scan_min_24h_quote", 0.0) or 0.0))
+        self.max_symbols = max(1, int(cfg.get("scan_max_symbols", 30) or 30))
+        self.exclude = set((cfg.get("scan_exclude") or []))
+        self.explicit = [s.strip().upper() for s in
+                         str(cfg.get("scanner_symbols", "")).split(",") if s.strip()]
+        self.trailing_pct = max(0.0, float(cfg.get("trailing_stop_pct", 0.0) or 0.0))
+        self.use_all_pct = max(0.0, float(cfg.get("use_all_balance_pct", 100.0) or 100.0))
+        self.buffer_pct = max(0.0, float(cfg.get("min_notional_buffer_pct", 0.0) or 0.0))
+        self.require_exit = bool(cfg.get("require_exit_viable", False))
+        self.closed_only = bool(cfg.get("signal_on_closed_candle", True))
+
+        if exchange is not None:
+            self._init_live()
+        else:
+            self._init_demo()
+
+    def _init_live(self):
+        """Connect / reuse a ccxt exchange; load markets and the scan universe."""
+        ex = self.exchange
+        if ex is None:
+            raise RuntimeError("MultiCoinScanner requires an exchange (or DEMO_MODE)")
+        self.log.info("Scanner: loading spot markets from the testnet ...")
+        markets = ex.load_markets()
+        self.symbol_rules = {s: symbol_rules(ex, s) for s in markets}
+        self.symbols = self._resolve_symbols(markets)
+        shown = ", ".join(self.symbols[:8]) + ("..." if len(self.symbols) > 8 else "")
+        self.log.info("Scanner universe: %d spot %s pair(s) [%s]",
+                      len(self.symbols), self.quote, shown or self.quote)
+
+    def _resolve_symbols(self, markets: dict) -> list:
+        """Explicit SCANNER_SYMBOLS win; otherwise dynamic + volume filter + cap."""
+        if self.explicit:
+            return [s for s in self.explicit if s in markets] or self.explicit
+        found = discover_spot_usdt_symbols(
+            markets, quote=self.quote, min_24h_quote=self.min_24h_quote,
+            exclude=self.exclude, max_symbols=0)
+        found = [s for s in found if s.upper() not in {e.upper() for e in self.exclude}]
+        if self.max_symbols and self.max_symbols > 0:
+            found = found[:self.max_symbols]
+        return found
+
+    def _init_demo(self):
+        """Synthetic offline universe: a few fake pairs advanced as random walks."""
+        self.log.warning(
+            "SCANNER DEMO_MODE=true -> simulating every pair locally (no exchange).")
+        if self.explicit:
+            self.symbols = [s if s.endswith("/" + self.quote) else s
+                            for s in self.explicit]
+        else:
+            n = min(self.max_symbols, 5) if self.max_symbols and self.max_symbols <= 5 else 5
+            bases = ["BTC", "ETH", "SOL", "BNB", "XRP"][:n]
+            self.symbols = [f"{base}/{self.quote}" for base in bases]
+        ms = self._timeframe_ms()
+        limit = int(self.cfg.get("candle_limit", 150))
+        for sym in self.symbols:
+            base, _ = sym.split("/")
+            self.paper_base.setdefault(base, 0.0)
+            rows, price = [], 60_000.0 if base == "BTC" else 3000.0
+            now = int(time.time() * 1000)
+            for i in range(limit):
+                ts = now - (limit - i) * ms
+                open_ = price
+                price = max(1e-6, open_ * (1.0 + random.gauss(0.0, 0.002)))
+                high = max(open_, price) * (1.0 + random.random() * 0.001)
+                low = min(open_, price) * (1.0 - random.random() * 0.001)
+                rows.append([ts, open_, high, low, price, random.uniform(0.5, 20.0)])
+            self.demo_dfs[sym] = pd.DataFrame(
+                rows, columns=["ts", "open", "high", "low", "close", "volume"])
+            self.symbol_rules[sym] = (0.0001, 10.0, 1e-8)
+
+    # -- small helpers --------------------------------------------------------
+    def _timeframe_ms(self) -> int:
+        unit = self.cfg["timeframe"][-1]
+        mult = int(self.cfg["timeframe"][:-1] or "1")
+        secs = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}.get(unit, 60)
+        return mult * secs * 1000
+
+    def _net_rr(self) -> dict:
+        fee = effective_fee_rate(self.cfg.get("fee_rate", 0.001), self.bnb_discount_pct)
+        return reward_risk_after_costs(
+            self.cfg["take_profit_pct"], self.cfg["stop_loss_pct"], fee,
+            self.cfg["slippage_pct"])
+
+    def _tp_sl_levels(self, entry):
+        if not entry or entry <= 0:
+            return None, None
+        return (entry * (1.0 + self.cfg["take_profit_pct"] / 100.0),
+                entry * (1.0 - self.cfg["stop_loss_pct"] / 100.0))
+
+    def get_quote_balance(self) -> float:
+        """Free balance in the scan quote currency (live or simulated)."""
+        if self.exchange is None:
+            return self.paper_usdt
+        bal = self.exchange.fetch_balance()
+        return float((bal.get(self.quote, {}) or {}).get("free") or 0.0)
+
+    def get_base_balance(self, symbol: str) -> float:
+        base, _ = symbol.split("/")
+        if self.exchange is None:
+            return self.paper_base.get(base, 0.0)
+        bal = self.exchange.fetch_balance()
+        return float((bal.get(base, {}) or {}).get("free") or 0.0)
+
+    def get_market_snapshot(self, symbol: str):
+        """Return (price, candles_df) for one symbol. Live or simulated."""
+        if self.exchange is None:
+            df = self.demo_dfs[symbol].copy()
+            last = float(df["close"].iloc[-1])
+            open_ = last
+            close = max(1e-6, open_ * (1.0 + random.gauss(0.0, 0.0015)))
+            high = max(open_, close) * (1.0 + random.random() * 0.0008)
+            low = min(open_, close) * (1.0 - random.random() * 0.0008)
+            vol = random.uniform(0.5, 20.0)
+            ts = int(df["ts"].iloc[-1]) + self._timeframe_ms()
+            new_row = pd.DataFrame([[ts, open_, high, low, close, vol]],
+                                   columns=df.columns)
+            df = pd.concat([df, new_row], ignore_index=True)
+            df = df.iloc[-int(self.cfg.get("candle_limit", 150)):].reset_index(drop=True)
+            df["ts"] = df["ts"].astype("int64")
+            self.demo_dfs[symbol] = df
+            return close, df
+        ticker = self.exchange.fetch_ticker(symbol)
+        price = float(ticker.get("last") or ticker.get("close") or 0.0)
+        ohlcv = self.exchange.fetch_ohlcv(
+            symbol, timeframe=self.cfg["timeframe"], limit=self.cfg["candle_limit"])
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        for col in ("open", "high", "low", "close", "volume"):
+            df[col] = df[col].astype("float64")
+        df["ts"] = df["ts"].astype("int64")
+        return price, df
+
+    def _fetch_snapshots(self, symbols):
+        """Fetch (price, df) for many symbols in parallel via a thread pool.
+
+        This is what makes multi-coin scanning fast: 20+ exchange round-trips run
+        concurrently instead of one long serial crawl, and each one happens off
+        the asyncio event loop (worker threads), so the loop never blocks.
+        """
+        if not symbols:
+            return {}
+        if self.exchange is None:
+            return {s: self.get_market_snapshot(s) for s in symbols}
+        limit = max(1, min(16, len(symbols)))   # keep the rate limiter sane
+        out = {}
+
+        def _one(symbol):
+            try:
+                return symbol, self.get_market_snapshot(symbol)
+            except Exception:
+                return symbol, None
+
+        with ThreadPoolExecutor(max_workers=limit) as pool:
+            for symbol, snap in pool.map(_one, symbols):
+                if snap is not None:
+                    out[symbol] = snap
+        return out
+
+    # -- order execution ------------------------------------------------------
+    def _place_buy(self, symbol: str, price: float, quote_free: float,
+                   budget: float, adx_now=None, rsi_now=None, reason="BUY signal"):
+        """Market-buy `budget` quote of `symbol`, respecting its lot rules."""
+        min_qty, min_cost, step = self.symbol_rules.get(symbol, (1e-8, 0.0, 1e-8))
+        fee = self._fee()
+        plan = plan_market_buy(
+            price, quote_free, order_size_quote=budget, min_qty=min_qty, step=step,
+            min_cost=min_cost, buffer_pct=self.buffer_pct, fee_rate=fee,
+            tp_pct=self.cfg["take_profit_pct"], sl_pct=self.cfg["stop_loss_pct"],
+            slippage_pct=self.cfg["slippage_pct"],
+            require_exit_viable=self.require_exit,
+            quote=self.quote, base=symbol.split("/")[0])
+        if not plan["ok"]:
+            self.log.info("[scan] BUY skip %s: %s (%s)", symbol, plan["reason"], plan["hint"])
+            return
+        qty, notional = plan["qty"], plan["notional"]
+        rr = self._net_rr()
+        tp, sl = self._tp_sl_levels(price)
+        with self.lock:
+            self.trade_counter += 1
+            self.positions[symbol] = {
+                "id": self.trade_counter, "symbol": symbol, "qty": qty,
+                "entry": price, "cost": notional, "tp": tp, "sl": sl,
+                "trail_peak": price, "opened_ts": time.time(),
+                "reason": reason, "adx": adx_now, "rsi": rsi_now,
+                "planned_rr": rr["rr"],
+            }
+        if self.exchange is None:
+            self.paper_usdt -= notional
+            self.paper_base[symbol.split("/")[0]] += qty * (1.0 - fee)
+            self.log.info(">> [scan] DEMO BUY %s qty=%.8f @ %,.2f (cost %.4f %s)",
+                          symbol, qty, price, notional, self.quote)
+        else:
+            order = self.exchange.create_market_buy_order(symbol, qty)
+            fill_price = float(order.get("average") or order.get("price") or price)
+            fill_qty = float(order.get("amount") or qty)
+            self.positions[symbol]["entry"] = fill_price
+            self.positions[symbol]["qty"] = fill_qty
+            self.positions[symbol]["cost"] = float(order.get("cost") or fill_price * fill_qty)
+            fill_tp, fill_sl = self._tp_sl_levels(fill_price)
+            self.positions[symbol]["tp"], self.positions[symbol]["sl"] = fill_tp, fill_sl
+            self.log.info(">> [scan] BUY %s id=%s qty=%s @ %s cost=%s",
+                          symbol, order.get("id"), fill_qty, f"{fill_price:,.2f}",
+                          f"{self.positions[symbol]['cost']:,.4f}")
+        self._notify_trade("BUY", symbol, self.positions[symbol])
+
+    def _place_sell(self, symbol: str, price: float, qty: float, reason: str):
+        """Market-sell `qty` of `symbol` and record the closed trade."""
+        min_qty, min_cost, step = self.symbol_rules.get(symbol, (1e-8, 0.0, 1e-8))
+        qty = max(0.0, min(float(qty), self.get_base_balance(symbol)))
+        qty = floor_to_step(qty, step)
+        if qty < min_qty:
+            self.log.info("[scan] SELL skip %s: qty %.8f < minQty", symbol, qty)
+            return
+        if min_cost and qty * price < min_cost:
+            self.log.warning("[scan] SELL skip %s: proceeds %.4f %s < minNotional %.2f",
+                             symbol, qty * price, self.quote, min_cost)
+            return
+        with self.lock:
+            pos = self.positions.pop(symbol, None)
+        if self.exchange is None:
+            self.paper_base[symbol.split("/")[0]] -= qty
+            self.paper_usdt += qty * price * (1.0 - self._fee())
+            fill_price, fill_qty = price, qty
+        else:
+            order = self.exchange.create_market_sell_order(symbol, qty)
+            fill_price = float(order.get("average") or order.get("price") or price)
+            fill_qty = float(order.get("amount") or qty)
+        entry = pos.get("entry") if pos else 0.0
+        pnl = (fill_price - entry) * fill_qty
+        if pos:
+            self.closed_trades.append({
+                "symbol": symbol, "id": pos.get("id"), "qty": fill_qty,
+                "entry": entry, "exit": fill_price, "pnl_quote": pnl,
+                "reason": reason, "closed_ts": time.time(),
+            })
+        self.log.info(">> [scan] SELL %s qty=%.8f @ %,.2f pnl=%+.4f %s | %s",
+                      symbol, fill_qty, fill_price, pnl, self.quote, reason)
+        if pos:
+            self._notify_trade("SELL", symbol, pos, pnl=pnl, reason=reason)
+
+    def _fee(self) -> float:
+        return effective_fee_rate(self.cfg.get("fee_rate", 0.001), self.bnb_discount_pct)
+
+    def _notify_trade(self, kind, symbol, pos, pnl=None, reason=""):
+        """Optional Telegram card for a scanner entry/exit (no-op when disabled)."""
+        if not self.tg.enabled:
+            return
+        try:
+            header = (f"🟢 BUY [{symbol}] #{pos['id']} - {pos.get('reason')}"
+                      if kind == "BUY" else
+                      f"🔴 SELL [{symbol}] #{pos.get('id')} - {reason}")
+            rr = self._net_rr()
+            body = [header, f"{symbol} @ {pos['entry']:,.2f}",
+                    f"Amount: {pos['qty']:.8f} {symbol.split('/')[0]}",
+                    f"Risk/reward R:R {rr['rr']:.2f} after costs"]
+            if pnl is not None:
+                body.append(f"P/L: {pnl:+.4f} {self.quote}")
+            self.tg.send("\n".join(body) + "\n" + self._stats_line())
+        except Exception as err:
+            self.log.debug("[telegram] scanner card skipped: %s", err)
+
+    def _stats_line(self) -> str:
+        with self.lock:
+            n = len(self.closed_trades)
+            wins = sum(1 for t in self.closed_trades if t["pnl_quote"] > 0)
+            pnl = sum(t["pnl_quote"] for t in self.closed_trades)
+            open_n = len(self.positions)
+        return (f"Portfolio: {open_n} open | {n} closed ({wins}W) | "
+                f"session P/L {pnl:+.4f} {self.quote}")
+
+    # -- the portfolio cycle --------------------------------------------------
+    def _scan_once(self):
+        """One full multi-coin cycle: balance -> proportional budget -> signals.
+
+        Exits (TP / SL / trailing stop / EMA death cross) run first and are never
+        gated. Entries run next, once per candle, only when EMA golden cross AND
+        ADX >= threshold, sized to one proportional slice of the free balance.
+        """
+        try:
+            if not self.symbols:
+                self.log.warning("[scan] no symbols to scan - is SCANNER_SYMBOLS empty?")
+                return
+            quote_free = self.get_quote_balance()
+            with self.lock:
+                reserved = sum(p.get("cost", 0.0) or 0.0
+                               for p in self.positions.values())
+            deploy = quote_free * max(0.0, self.use_all_pct) / 100.0
+            prop = compute_proportional_budget(
+                deploy, parts=self.parts, floor_usdt=self.floor_usdt)
+            per_part = prop["per_part"]
+            self.log.info(
+                "[scan] free %,.4f %s | deploy %,.2f -> %d/%d part(s) @ %,.4f %s each "
+                "(reserved %,.4f by %d open)",
+                quote_free, self.quote, deploy, prop["usable_parts"], prop["parts"],
+                per_part, self.quote, reserved, len(self.positions)
+                if len(self.positions) else 0)
+
+            snapshots = self._fetch_snapshots(self.symbols)
+            for symbol in self.symbols:
+                if symbol not in snapshots:
+                    continue
+                price, df = snapshots[symbol]
+                if price <= 0 or df is None or len(df) < 2:
+                    continue
+                df = compute_indicators(df, self.cfg)
+                closed_only = self.closed_only and len(df) > 2
+                signal, rsi, adx, _why = current_signal(
+                    df, self.cfg["adx_threshold"], closed_only=closed_only)
+                candle_ts = int(df["ts"].iloc[-1])
+                min_qty, min_cost, _ = self.symbol_rules.get(symbol, (1e-8, 0.0, 1e-8))
+                base_free = self.get_base_balance(symbol)
+                in_position = symbol in self.positions and base_free >= min_qty
+
+                # 1) exits first - never gated by anything.
+                if in_position:
+                    exit_reason = self._exit_reason(symbol, price, signal)
+                    if exit_reason:
+                        self._place_sell(symbol, price, self.positions[symbol]["qty"],
+                                         exit_reason)
+                        self.last_signal_candle[symbol] = candle_ts
+                    continue
+
+                # 2) proportional entry, once per candle.
+                if signal != "BUY":
+                    continue
+                if self.last_signal_candle.get(symbol) == candle_ts:
+                    continue
+                available = max(0.0, quote_free - reserved)
+                budget = per_part if per_part > 0 else available
+                budget = min(budget, available)
+                if budget < min_cost * (1.0 + self.buffer_pct / 100.0) and min_cost > 0:
+                    self.log.info(
+                        "[scan] BUY skip %s: proportional part %,.4f %s < minNotional %s",
+                        symbol, budget, self.quote, f"{min_cost:,.2f}")
+                    continue
+                self._place_buy(symbol, price, available, budget,
+                                adx_now=adx, rsi_now=rsi,
+                                reason=f"EMA golden cross (ADX {self._fmt(adx)})")
+                self.last_signal_candle[symbol] = candle_ts
+                with self.lock:
+                    reserved = sum(p.get("cost", 0.0) or 0.0
+                                   for p in self.positions.values())
+
+            if self.failures:
+                self.tg.send(f"🟢 Scanner reconnected after {self.failures} failure(s).")
+            self.failures = 0
+        except ccxt.NetworkError as err:
+            self._recover("network", err)
+        except (ccxt.AuthenticationError, ccxt.PermissionDenied) as err:
+            self._recover("credentials", err)
+        except Exception as err:
+            self.log.exception("[scan] unexpected error (scanner keeps running): %s", err)
+            self._recover("unexpected", err)
+
+    def _exit_reason(self, symbol: str, price: float, ema_signal: str) -> str:
+        """Close reason when a hard TP/SL/trailing level or an EMA SELL fires."""
+        pos = self.positions.get(symbol)
+        if not pos or pos.get("entry") is None or pos["entry"] <= 0:
+            return ""
+        entry = pos["entry"]
+        tp, sl = self._tp_sl_levels(entry)
+        if price >= tp:
+            return f"TAKE-PROFIT +{self.cfg['take_profit_pct']:g}% hit (target {tp:,.2f})"
+        if price <= sl:
+            return f"STOP-LOSS -{self.cfg['stop_loss_pct']:g}% hit (stop {sl:,.2f})"
+        if self.trailing_pct > 0:
+            prev_peak = float(pos.get("trail_peak") or entry)
+            pos["trail_peak"] = max(prev_peak, price)
+            if trailing_stop_hit(entry, prev_peak, price, self.trailing_pct):
+                level = trailing_stop_level(entry, max(prev_peak, price),
+                                            self.trailing_pct)
+                return (f"TRAILING-STOP -{self.trailing_pct:g}% hit "
+                        f"(peak {max(prev_peak, price):,.2f} -> stop {level:,.2f})")
+        if ema_signal == "SELL":
+            return "EMA death cross (fast crossed below slow)"
+        return ""
+
+    @staticmethod
+    def _fmt(value) -> str:
+        try:
+            if value is None or pd.isna(value):
+                return "n/a"
+            return f"{float(value):.1f}"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    def _recover(self, kind: str, err: Exception) -> None:
+        self.failures += 1
+        wait = min(max(5.0, self.cfg.get("scan_poll_seconds", 60)) *
+                   (2 ** min(self.failures - 1, 4)), 300)
+        self.log.warning("[scan %s issue] %s | failures=%d -> retrying in %.0fs",
+                          kind, err, self.failures, wait)
+        time.sleep(wait)
+
+    def run(self):
+        """Blocking portfolio loop (classic entry point); Ctrl+C stops cleanly."""
+        cfg = self.cfg
+        self.log.info("Scanner running. Polling %d symbol(s) every %ds. Ctrl+C to stop.",
+                      len(self.symbols), cfg.get("scan_poll_seconds", 60))
+        while True:
+            try:
+                self._scan_once()
+                time.sleep(max(0.0, float(cfg.get("scan_poll_seconds", 60))))
+            except KeyboardInterrupt:
+                self.log.info("Keyboard interrupt received - shutting the scanner down.")
+                break
+
+    async def run_async(self):
+        """Asyncio twin of run(): blocking scans run in a worker thread via
+        loop.run_in_executor, so the event loop stays responsive while the
+        scanner crawls many pairs."""
+        cfg = self.cfg
+        loop = asyncio.get_running_loop()
+        self.log.info("Scanner running (asyncio). Polling %d symbol(s) every %ds.",
+                      len(self.symbols), cfg.get("scan_poll_seconds", 60))
+        while True:
+            await loop.run_in_executor(None, self._scan_once)
+            await asyncio.sleep(max(0.0, float(cfg.get("scan_poll_seconds", 60))))
+
+    def close(self) -> None:
+        """Release exchange resources (idempotent, never raises)."""
+        ex = self.exchange
+        if ex is None:
+            return
+        closer = getattr(ex, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception as err:
+                self.log.debug("scanner exchange.close() failed (ignored): %s", err)
+
+
+# ------------------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------------------
 async def run_async(cfg: dict = None) -> None:
@@ -1987,6 +2668,9 @@ def main(use_async: bool = None) -> int:
     """
     if use_async is None:
         use_async = any(arg in ("--async", "--asyncio") for arg in sys.argv[1:])
+    use_scan = (cfg["scan_enabled"]
+                or any(arg in ("--scan", "--multi", "--all-pairs")
+                       for arg in sys.argv[1:]))
     cfg = load_config()
     setup_logging(cfg["log_level"])
     log = logging.getLogger("bot")
@@ -2027,6 +2711,33 @@ def main(use_async: bool = None) -> int:
             "DEMO_MODE=true to simulate."
         )
         return 1
+
+    if use_scan:
+        log.info("Mode     : %s (MULTI-COIN SCANNER)",
+                 "LOCAL DEMO SIMULATION" if cfg["demo_mode"]
+                 else "LIVE TESTNET (paper money @ testnet.binance.vision)")
+        log.info("Scanner  : %d proportional part(s) of the %s balance | quote %s | "
+                 "floor %.2f %s | BNB fee discount %.1f%% | trailing stop %.1f%%",
+                 cfg["portfolio_parts"], cfg["scan_quote"], cfg["scan_quote"],
+                 cfg["portfolio_floor_usdt"], cfg["scan_quote"],
+                 cfg["bnb_fee_discount_pct"], cfg["trailing_stop_pct"])
+        log_env_conflicts(log)
+        try:
+            scanner = MultiCoinScanner(cfg)
+        except Exception as err:
+            log.error("Failed to initialise the scanner: %s", err)
+            return 1
+        scanner.tg.verify()
+        try:
+            if use_async:
+                asyncio.run(scanner.run_async())
+            else:
+                scanner.run()
+        except KeyboardInterrupt:
+            log.info("Keyboard interrupt received - shutting the scanner down.")
+        finally:
+            scanner.close()
+        return 0
 
     try:
         bot = BinanceTestnetBot(cfg)

@@ -149,6 +149,39 @@ residual balances behave like the live account. `python smoke_test.py` verifies
 this scenario (minNotional gate, lot-step bump, dust protection, fee residuals)
 without any network access.
 
+### Multi-coin / all-USDT-pairs scanner (optional, async)
+
+The classic bot trades one `SYMBOL`. Turn the scanner on and it trades a whole
+portfolio of spot pairs at once:
+
+```bash
+# set SCAN_ENABLED=true in .env,  OR  pass a CLI flag:
+python trading_bot.py --scan          # sync loop
+python trading_bot.py --scan --async  # asyncio loop (worker threads keep it responsive)
+```
+
+What it does:
+
+1. **Dynamic universe.** Each cycle it calls `load_markets()` and picks every
+   active SPOT pair quoted in `SCAN_QUOTE` (USDT by default), optionally dropped
+   to the high-volume ones via `SCAN_MIN_24H_QUOTE`, minus `SCAN_EXCLUDE`, capped
+   at `SCAN_MAX_SYMBOLS`. You can force an explicit list with `SCANNER_SYMBOLS`.
+2. **Proportional position sizing.** The free balance is split into
+   `PORTFOLIO_PARTS` equal budgets (the reference video splits the account into
+   21 parts). On a $10 account each slot is floored to `PORTFOLIO_FLOOR_USDT` /
+   minNotional, so it auto-degrades to one safe, exit-viable slot; on $50+ it
+   spreads across several properly-sized slots. `USE_ALL_BALANCE_PCT` reserves
+   cash for fees.
+3. **Same risk rules, per pair.** Each open position gets its own hard
+   Take-Profit, Stop-Loss and optional Trailing-Stop (`TRAILING_STOP_PCT`), and
+   the EMA + ADX trend filter (`ADX_THRESHOLD`, default 25) gates every new entry.
+4. **Non-blocking, parallel scanning.** Per-symbol price/candle fetches run in a
+   thread pool, and the `--async` loop runs each full cycle in a worker thread,
+   so the event loop stays responsive while the scanner crawls many pairs.
+
+`DEMO_MODE=true` runs the same portfolio loop on synthetic data so you can watch
+it before adding keys.
+
 ### Running inside an asyncio application
 
 The classic loop is blocking, which is fine for a terminal bot. To embed the bot
@@ -270,7 +303,10 @@ places a real order. It covers:
   guarantee that an exit is never blocked by them;
 - Telegram notifier behaviour (retries, background queue, disk spool, message
   content) and the fail-safe startup self-checks;
-- the asyncio entry point (`run_async`) and clean cancellation.
+- the asyncio entry point (`run_async`) and clean cancellation;
+- the multi-coin scanner: dynamic `/USDT` symbol discovery, proportional
+  (21-part) position sizing from $10 to $50+, per-pair TP/SL + trailing stop,
+  BNB fee-discount handling, and a non-blocking asyncio scanner loop.
 
 ```bash
 python smoke_test.py     # all checks should print PASS

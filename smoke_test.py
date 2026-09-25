@@ -925,6 +925,145 @@ demo_probe.close()                     # harmless: the demo bot has no exchange
 demo_probe.place_buy(60000.0, 10.2)
 check("close() is a harmless no-op for the demo bot", demo_probe.paper_btc > 0)
 
+def _exercise_scanner(scanner, cycles=3):
+    """Run a few full portfolio cycles on random demo data; must not crash."""
+    try:
+        for _ in range(cycles):
+            scanner._scan_once()
+        return True
+    except Exception:
+        return False
+
+# 5) Multi-coin / proportional sizing & risk (new) -----------------------------
+# 5a) Proportional budget: split the balance into N parts, floored to minNotional.
+p10 = t.compute_proportional_budget(10.0, parts=21, floor_usdt=10.0)
+check("proportional: $10 / 21 parts / $10 floor -> one safe $10 slot",
+      p10["usable_parts"] == 1 and abs(p10["per_part"] - 10.0) < 1e-9
+      and abs(p10["active_budget"] - 10.0) < 1e-9)
+p50 = t.compute_proportional_budget(50.0, parts=21, floor_usdt=10.0)
+check("proportional: $50 / 21 parts / $10 floor -> five $10 slots",
+      p50["usable_parts"] == 5 and abs(p50["per_part"] - 10.0) < 1e-9)
+p210 = t.compute_proportional_budget(210.0, parts=21, floor_usdt=0.0)
+check("proportional: $210 / 21 parts -> 21 x $10 (the video rule)",
+      p210["usable_parts"] == 21 and abs(p210["per_part"] - 10.0) < 1e-9)
+pmin = t.compute_proportional_budget(10.0, parts=21, floor_usdt=0.0, min_cost=10.0)
+check("proportional: minNotional auto-shrinks the parts count",
+      pmin["usable_parts"] == 1 and abs(pmin["floor"] - 10.0) < 1e-9)
+check("proportional: zero balance -> zero budget, no crash",
+      t.compute_proportional_budget(0.0, 21, 10.0)["usable_parts"] == 0)
+
+# 5b) Trailing stop: drags the stop up behind a rising peak and locks profit.
+check("trailing stop level = peak - trail%",
+      abs(t.trailing_stop_level(100.0, 105.0, 3.0) - 101.85) < 1e-9)
+check("trailing stop fires once price drops trail% below the peak",
+      t.trailing_stop_hit(100.0, 105.0, 101.8, 3.0) is True
+      and t.trailing_stop_hit(100.0, 105.0, 102.5, 3.0) is False)
+check("trailing stop is inert when disabled (0%)",
+      t.trailing_stop_hit(100.0, 105.0, 100.0, 0.0) is False)
+
+# 5c) BNB fee discount: 0.1% taker cut 25% when paying with BNB.
+fee_disc = t.effective_fee_rate(0.001, 25.0)
+check("BNB fee discount: 0.1% -> 0.075% at 25% discount",
+      abs(fee_disc - 0.00075) < 1e-12)
+
+# 5d) Dynamic symbol discovery: spot / quote / volume-sorted / capped / excluded.
+_mk = t.discover_spot_usdt_symbols(
+    {
+        "BTC/USDT": {"type": "spot", "stats": {"quoteVolume": 1e9}},
+        "ETH/USDT": {"type": "spot", "stats": {"quoteVolume": 5e8}},
+        "BTCUSDT":  {"type": "spot"},
+        "BTC/EUR":  {"type": "spot", "stats": {"quoteVolume": 9e8}},
+        "TRASH/USDT": {"type": "spot", "stats": {"quoteVolume": 100}},
+        "SHIB/USDT": {"type": "spot", "info": {"quoteVolume": 2e7}},
+    },
+    "USDT", min_24h_quote=1e6, exclude=("SHIB/USDT",), max_symbols=3)
+check("discovery: only high-volume /USDT pairs, volume-sorted + capped",
+      _mk == ["BTC/USDT", "ETH/USDT"])
+check("discovery: EUR quote and non-/-USDT names are ignored",
+      "BTC/EUR" not in _mk and "BTCUSDT" not in _mk)
+
+# 5e) MultiCoinScanner demo lifecycle: proportional BUY -> trailing/TP -> SELL.
+scan_cfg = dict(t.load_config(), demo_mode=True, initial_balance_usdt=50.0,
+                scanner_symbols="BTC/USDT,ETH/USDT,SOL/USDT", portfolio_parts=21,
+                portfolio_floor_usdt=10.0, trailing_stop_pct=2.0)
+scan = t.MultiCoinScanner(scan_cfg)
+scan.tg = t.TelegramNotifier("", "", scan.log)
+check("scanner demo: explicit universe is honoured",
+      set(scan.symbols) == {"BTC/USDT", "ETH/USDT", "SOL/USDT"})
+scan._place_buy("BTC/USDT", 60000.0, scan.paper_usdt, 10.0, adx_now=30.0)
+check("scanner BUY: position opened and sized to the proportional part",
+      scan.positions and scan.positions["BTC/USDT"]["entry"] == 60000.0
+      and abs(scan.positions["BTC/USDT"]["cost"] - 10.0) < 0.05)
+check("scanner BUY: spends the proportional budget (50 -> ~40 left)",
+      abs(scan.paper_usdt - 40.0) < 0.1)
+check("scanner: no exit inside the TP/SL bracket",
+      scan._exit_reason("BTC/USDT", 60500.0, "HOLD") == "")
+scan.positions["BTC/USDT"]["trail_peak"] = 61000.0
+check("scanner trailing stop fires after a pullback from the peak",
+      "TRAILING-STOP" in scan._exit_reason("BTC/USDT", 59750.0, "HOLD"))
+check("scanner TP fires at +2.5%",
+      "TAKE-PROFIT" in scan._exit_reason("BTC/USDT", 61500.0, "HOLD"))
+_qty = scan.positions["BTC/USDT"]["qty"]
+scan._place_sell("BTC/USDT", 61000.0, _qty, "TAKE-PROFIT +2.5% hit")
+check("scanner SELL: position closed and the trade recorded",
+      "BTC/USDT" not in scan.positions and len(scan.closed_trades) == 1
+      and scan.closed_trades[0]["pnl_quote"] > 0)
+check("scanner close() is a harmless no-op for the demo scanner",
+      scan.close() is None)
+check("scanner _scan_once() runs several full cycles without crashing",
+      _exercise_scanner(scan))
+
+# 5f) Single-symbol bot: the same trailing-stop rule now protects its positions.
+trail_bot = t.BinanceTestnetBot(dict(cfg10, order_size_quote=10.2, trailing_stop_pct=2.0))
+trail_bot.tg = t.TelegramNotifier("", "", trail_bot.log)
+trail_bot.place_buy(60000.0, 10.2)
+check("single bot: the trailing stop guard is wired to the entry price",
+      trail_bot.trailing_stop_pct == 2.0
+      and trail_bot.position.get("trail_peak") == trail_bot.avg_entry_price == 60000.0)
+check("single bot: a fixed TP still fires before the trailing stop",
+      (trail_bot._tp_sl_exit_reason(60000.0 * 1.025) or "").startswith("TAKE-PROFIT"))
+trail_bot.position["trail_peak"] = 61500.0
+# The exit string is produced inside _tick; the pure helper behind it must agree.
+check("single bot: trailing-stop helper locks profit off the raised peak",
+      t.trailing_stop_hit(60000.0, 61500.0, 60250.0, trail_bot.trailing_stop_pct)
+      and not t.trailing_stop_hit(60000.0, 61500.0, 60280.0, trail_bot.trailing_stop_pct))
+
+# 5g) asyncio: the scanner loop stays responsive while each cycle "blocks".
+async_scan = t.MultiCoinScanner(dict(scan_cfg, scan_poll_seconds=0.05))
+async_scan.tg = t.TelegramNotifier("", "", async_scan.log)
+scan_ticks = {"n": 0}
+
+
+def _slow_scan():
+    scan_ticks["n"] += 1
+    time.sleep(0.05)
+
+
+async_scan._scan_once = _slow_scan
+
+
+async def _drive_scanner():
+    task = asyncio.create_task(async_scan.run_async())
+    beats = 0
+    started = time.monotonic()
+    while time.monotonic() - started < 0.5:
+        await asyncio.sleep(0.01)
+        beats += 1
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+    return beats
+
+
+scan_beats = asyncio.run(_drive_scanner())
+check("asyncio scanner: ran multiple portfolio cycles", scan_ticks["n"] >= 2)
+check("asyncio scanner: blocking scans run in a worker thread (loop responsive)",
+      scan_beats >= 20)
+check("asyncio scanner: run_async() is an awaitable coroutine",
+      asyncio.iscoroutinefunction(t.MultiCoinScanner.run_async))
+
 
 
 print("\nSMOKE TEST:", "OK" if not failures else "FAILED -> " + ", ".join(failures))
