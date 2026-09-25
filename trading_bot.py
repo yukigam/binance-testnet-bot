@@ -1251,6 +1251,7 @@ class BinanceTestnetBot:
             "options": {
                 "defaultType": "spot",        # we only trade spot pairs
                 "adjustForTimeDifference": True,  # avoids timestamp/recvWindow errors
+                "fetchMarkets": ["spot"],     # don't query dead/hanging futures testnet endpoints
             },
         })
 
@@ -2214,7 +2215,26 @@ class MultiCoinScanner:
         self.require_exit = bool(cfg.get("require_exit_viable", False))
         self.closed_only = bool(cfg.get("signal_on_closed_candle", True))
 
-        if exchange is not None:
+        if not cfg.get("demo_mode", False):
+            if not self.exchange:
+                if not cfg.get("api_key") or not cfg.get("api_secret"):
+                    raise RuntimeError(
+                        "Missing testnet API keys. Either add BINANCE_TESTNET_API_KEY / "
+                        "BINANCE_TESTNET_API_SECRET to your .env file, or set DEMO_MODE=true."
+                    )
+                self.log.info("Creating ccxt Binance exchange object for scanner ...")
+                self.exchange = ccxt.binance({
+                    "apiKey": cfg["api_key"],
+                    "secret": cfg["api_secret"],
+                    "enableRateLimit": True,
+                    "timeout": 20000,
+                    "options": {
+                        "defaultType": "spot",
+                        "adjustForTimeDifference": True,
+                        "fetchMarkets": ["spot"],
+                    },
+                })
+                self.exchange.set_sandbox_mode(True)
             self._init_live()
         else:
             self._init_demo()
@@ -2226,6 +2246,14 @@ class MultiCoinScanner:
             raise RuntimeError("MultiCoinScanner requires an exchange (or DEMO_MODE)")
         self.log.info("Scanner: loading spot markets from the testnet ...")
         markets = ex.load_markets()
+        try:
+            self.log.info("Scanner: fetching 24h tickers to sort by trading volume ...")
+            tickers = ex.fetch_tickers()
+            for sym, tick in (tickers or {}).items():
+                if sym in markets and isinstance(tick, dict):
+                    markets[sym]["stats"] = tick
+        except Exception as err:
+            self.log.warning("Scanner: fetch_tickers failed (%s); volume sort will use market stats.", err)
         self.symbol_rules = {s: symbol_rules(ex, s) for s in markets}
         self.symbols = self._resolve_symbols(markets)
         shown = ", ".join(self.symbols[:8]) + ("..." if len(self.symbols) > 8 else "")
