@@ -21,20 +21,61 @@ and fakeouts. The threshold is configurable via ADX_THRESHOLD.
 RSI(14) is also computed and printed so you can keep an eye on
 overbought / oversold conditions.
 
-RISK MANAGEMENT (automatic TP / SL)
------------------------------------
+RISK MANAGEMENT (automatic TP / SL / trailing stop)
+---------------------------------------------------
 Every open position is protected by hard price limits applied to the entry:
     * Take-Profit  +2.5%  -> close the position when price rises to that level
     * Stop-Loss    -1.0%  -> close the position when price falls to that level
-TP/SL are checked against the live price on every poll (not just once per
-candle), and the opposite EMA cross still closes the position too. All values
-are configurable via .env (TAKE_PROFIT_PCT / STOP_LOSS_PCT).
+    * Trailing stop (TRAILING_STOP_PCT, e.g. 1.0%) -> while the price rises the
+      stop is dragged up behind it, and the position closes when the price
+      drops that far from its post-entry peak, locking in profit instead of
+      handing the whole win back.
+TP/SL/trailing are checked against the live price on every poll (not just once
+per candle), and the opposite EMA cross still closes the position too. All
+values are configurable via .env.
 The bot prints the *net* reward/risk after fees and estimated slippage - a
 +2.5% / -1.0% bracket is only ~+2.2% / -1.3% after two 0.1% taker fees, i.e.
 an R:R of ~1.7, so one win pays for roughly one and a half losses.
 
-POSITION SIZING (small balances, e.g. 10 USDT)
-----------------------------------------------
+DCA - AVERAGING DOWN INSTEAD OF AN IMMEDIATE STOP-OUT (optional)
+----------------------------------------------------------------
+With DCA_ENABLED=true a position that drops DCA_DROP_PERCENT (default 1.5%)
+below its *current average* entry buys DCA_SIZE_QUOTE more of the same coin
+instead of being stopped out on the spot. That lowers the average entry (and
+with it the TP/SL levels) and gives the trade room to recover. Guard rails:
+    * at most DCA_MAX_ENTRIES adds (default 2) and never twice on one candle,
+    * never add once the price has already broken the hard stop-loss (the
+      position is then closed as usual - no averaging into a broken trade),
+    * never add past DCA_MAX_POSITION_QUOTE (per-coin exposure cap) or past the
+      free USDT balance,
+    * every add is lot/minNotional checked exactly like the first entry, so a
+      small account can never send a dust order.
+Take-profit and trailing-stop exits always win over DCA: profit is taken, and
+losses are only averaged while the trade is still inside its stop.
+
+RSI FILTER (optional, off by default)
+-------------------------------------
+Besides the ADX trend filter an entry can additionally be blocked by
+RSI_MAX_ENTRY (skip a BUY when RSI is above it, e.g. 75 = do not buy into a
+blow-off top) and RSI_MIN_ENTRY. 0 disables the check. RSI is always logged and
+reported to Telegram.
+
+COIN LIST / MULTI-COIN SCANNING
+-------------------------------
+SCANNER_SYMBOLS (e.g. "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT" - plain
+"BTCUSDT,BTCUSDT" style names are accepted too) makes the bot poll that list
+one coin after another, every SCAN_POLL_SECONDS, and open a position in the
+first coin that shows an active BUY setup (EMA golden cross + ADX trend filter
++ RSI filter), each with its own proportional budget and its own TP/SL/
+trailing stop. Empty SCANNER_SYMBOLS = discover every liquid /USDT pair.
+
+POSITION SIZING (a 50 USDT test balance)
+----------------------------------------
+The defaults are tuned for a 50.00 USDT testnet balance: ORDER_SIZE_QUOTE=10
+spends 10 USDT per entry (five slots), the multi-coin scanner splits the
+balance into PORTFOLIO_PARTS proportional slots that are floored to the
+exchange minimum, and USE_ALL_BALANCE_PCT=80 keeps a ~10 USDT reserve for DCA
+adds and fees.
 A market order is only sent when the *rounded* order really passes the
 exchange's MIN_NOTIONAL filter: the bot floors the quantity to the lot step,
 bumps it up by one step when that flooring would fall below minNotional (only
@@ -58,10 +99,12 @@ Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to the .env file (setup guide in
 README.md) and the bot will push a message when it starts, on every BUY/SELL
 order and on critical errors / network problems. Trade messages are
 self-contained: they carry the trade number, entry/exit price, quantity,
-notional, the *reason* for the order (EMA death cross or which hard TP/SL
-level was hit), the TP/SL levels, ADX/RSI at entry, holding time, P/L in
-USDT + %, and the running session statistics, so the chat doubles as a trade
-journal. Every message goes through an automatic retry
+notional, the *reason* for the order (EMA death cross or which hard TP/SL/
+trailing level was hit), the TP/SL levels, ADX/RSI at entry, holding time,
+P/L in USDT + %, and the running session statistics, so the chat doubles as a
+trade journal. A DCA add gets its own card: trigger price, amount added, the
+old -> new average entry, the recomputed TP/SL, the remaining DCA budget and
+the current unrealised P/L. Every message goes through an automatic retry
 mechanism (a few quick attempts, then a background queue keeps re-sending),
 so a temporary internet outage - connection timeout, DNS/NameResolutionError
 - can neither crash the bot, nor block the trading loop, nor lose a message.
@@ -186,6 +229,12 @@ def load_config() -> dict:
         # of the classic 20 keeps the bot out of weak trends and fakeouts.
         "adx_period": int(os.getenv("ADX_PERIOD", "14")),
         "adx_threshold": float(os.getenv("ADX_THRESHOLD", "25")),
+        # Optional RSI entry filter on top of the ADX gate (0 = disabled).
+        # RSI_MAX_ENTRY=75 refuses to chase a blow-off top; RSI_MIN_ENTRY skips
+        # entries while the market is still deeply oversold. RSI is always
+        # computed and reported - these only control whether it can block a BUY.
+        "rsi_max_entry": float(os.getenv("RSI_MAX_ENTRY", "0")),
+        "rsi_min_entry": float(os.getenv("RSI_MIN_ENTRY", "0")),
         # Risk management: hard Take-Profit / Stop-Loss percentages applied to
         # the entry price. A wider target (+2.5%) than stop (-1.0%) means one
         # winner covers roughly one and a half losers - the classic way to stay
@@ -217,14 +266,17 @@ def load_config() -> dict:
         # Sell only the quantity the bot actually bought (keeps a pre-existing
         # testnet/BTC balance untouched). false = legacy "sell all free base".
         "sell_only_tracked_qty": os.getenv("SELL_ONLY_TRACKED_QTY", "true").strip().lower() != "false",
+        # Quote amount spent on each market BUY. On the 50 USDT test balance 10
+        # leaves five slots plus room for DCA adds; the multi-coin scanner
+        # derives its own per-coin budget from PORTFOLIO_PARTS instead.
         "order_size_quote": float(os.getenv("ORDER_SIZE_QUOTE", "10")),  # USDT per BUY
         # Spot trading fee (0.1% taker on Binance) simulated in DEMO mode so a
         # 10 USDT balance behaves realistically (fees shrink the position).
         "fee_rate": float(os.getenv("FEE_RATE", "0.001")),
-        # Starting "testnet" balance in DEMO / mock mode. Set to 10.00 USDT to
-        # mirror the real 10.00 USDT testnet balance the bot is validated
-        # against (Binance minNotional for BTCUSDT is also ~10 USDT).
-        "initial_balance_usdt": float(os.getenv("INITIAL_BALANCE_USDT", "10.0")),
+        # Starting balance in DEMO / mock mode. 50.00 USDT mirrors the test
+        # balance this bot is tuned for: five 10 USDT slots, each comfortably
+        # above Binance's minNotional (~5..10 USDT depending on the pair).
+        "initial_balance_usdt": float(os.getenv("INITIAL_BALANCE_USDT", "50.0")),
         "candle_limit": int(os.getenv("CANDLE_LIMIT", "150")),
         # --- Telegram notifications (optional, see README.md) ----------------
         "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -272,6 +324,25 @@ def load_config() -> dict:
         # behind it, locking in profit, and the position closes when price drops
         # this many % from its post-entry peak. 0 = classic fixed stop only.
         "trailing_stop_pct": float(os.getenv("TRAILING_STOP_PCT", "0")),
+        # The trailing stop only *arms* once the post-entry peak climbed this
+        # many % above the (current average) entry, so on a straight decline the
+        # DCA / fixed stop-loss rules handle the trade instead of a 1% "trail"
+        # exit. No effect while TRAILING_STOP_PCT=0.
+        "trailing_arm_pct": max(0.0, float(os.getenv("TRAILING_ARM_PCT", "0.5"))),
+        # --- DCA / averaging down ------------------------------------------
+        # Instead of being stopped out on the spot, a position that falls
+        # DCA_DROP_PERCENT below its current average entry buys
+        # DCA_SIZE_QUOTE more of the same coin (0 -> ORDER_SIZE_QUOTE), which
+        # lowers the average entry and the TP/SL levels attached to it.
+        "dca_enabled": os.getenv("DCA_ENABLED", "false").strip().lower() == "true",
+        "dca_drop_pct": max(0.0, float(os.getenv("DCA_DROP_PERCENT", "1.5"))),
+        # Quote amount per DCA add. 0 = reuse ORDER_SIZE_QUOTE.
+        "dca_size_quote": max(0.0, float(os.getenv("DCA_SIZE_QUOTE", "0"))),
+        # How many adds a single position may receive (0 = DCA disabled).
+        "dca_max_entries": max(0, int(os.getenv("DCA_MAX_ENTRIES", "2"))),
+        # Hard cap on the total quote amount a single position may hold after
+        # averaging down (0 = only limited by the free balance).
+        "dca_max_position_quote": max(0.0, float(os.getenv("DCA_MAX_POSITION_QUOTE", "0"))),
         # Binance BNB-fee-discount (0..25%). Holding BNB cuts the taker fee by up
         # to 25%; this is reflected in the effective fee used for sizing & R:R.
         "bnb_fee_discount_pct": float(os.getenv("BNB_FEE_DISCOUNT_PCT", "0")),
@@ -846,15 +917,41 @@ def reward_risk_after_costs(tp_pct: float, sl_pct: float, fee_rate: float,
     }
 
 
+def rsi_entry_block(rsi_now, rsi_max: float = 0.0, rsi_min: float = 0.0) -> str:
+    """
+    Explain why RSI forbids a new entry, or "" when RSI is fine (or disabled).
+
+    `rsi_max` refuses to chase a blow-off top (RSI above it), `rsi_min` refuses
+    to enter while the market is still deeply oversold. 0 turns a bound off, so
+    the default configuration behaves exactly like the RSI-less strategy.
+    """
+    try:
+        if rsi_now is None or pd.isna(rsi_now):
+            return ""
+        value = float(rsi_now)
+    except (TypeError, ValueError):
+        return ""
+    if rsi_max and rsi_max > 0 and value > float(rsi_max):
+        return (f"RSI={value:.1f} > RSI_MAX_ENTRY={float(rsi_max):g} "
+                f"(too overbought to start a trade)")
+    if rsi_min and rsi_min > 0 and value < float(rsi_min):
+        return (f"RSI={value:.1f} < RSI_MIN_ENTRY={float(rsi_min):g} "
+                f"(too oversold to start a trade)")
+    return ""
+
+
 def current_signal(df: pd.DataFrame, adx_threshold: float = 25.0,
-                   closed_only: bool = False) -> tuple:
+                   closed_only: bool = False, rsi_max: float = 0.0,
+                   rsi_min: float = 0.0) -> tuple:
     """
     Detect an EMA crossover using the last two *completed* candles.
 
     A BUY (new entry) is only allowed when the market is trending: ADX must be
     above `adx_threshold` (> 25 by default) so we skip choppy / side-ways moves
-    and fakeout crosses. A SELL (position exit) is never gated by ADX -
-    protecting the position is always allowed, regardless of trend strength.
+    and fakeout crosses, and the optional RSI bounds (`rsi_max` / `rsi_min`,
+    0 = off) must not be violated either. A SELL (position exit) is never gated
+    by ADX or RSI - protecting the position is always allowed, regardless of
+    trend strength.
 
     `closed_only=True` ignores the newest candle (which is usually still
     forming while the bot polls) and reads the two last completed candles
@@ -885,6 +982,9 @@ def current_signal(df: pd.DataFrame, adx_threshold: float = 25.0,
             return ("HOLD", rsi_now, adx_now,
                     f"golden cross but ADX={adx_now:.1f} <= {adx_threshold:.0f} "
                     f"(no trend - entry filtered out)")
+        blocked = rsi_entry_block(rsi_now, rsi_max, rsi_min)
+        if blocked:
+            return "HOLD", rsi_now, adx_now, f"golden cross but {blocked}"
         return "BUY", rsi_now, adx_now, "EMA fast crossed ABOVE EMA slow (ADX trend OK)"
     if prev_fast >= prev_slow and last_fast < last_slow:
         return "SELL", rsi_now, adx_now, "EMA fast crossed BELOW EMA slow"
@@ -941,6 +1041,32 @@ def min_viable_balance(min_cost: float, step: float, price: float,
                    * (1.0 - (max(0.0, sl_pct) + max(0.0, slippage_pct)) / 100.0))
     need = min_cost / exit_factor if exit_factor > 0 else float("inf")
     return max(need, min_cost) + max(0.0, step) * max(0.0, price)
+
+
+def run_deadline(cfg: dict, log) -> float:
+    """
+    Shared RUN_FOR_SECONDS handling for every loop (single bot + scanner).
+
+    RUN_FOR_SECONDS is a TEST-ONLY convenience: in DEMO_MODE the loop may
+    stop itself after N seconds. In production mode the limit is IGNORED -
+    the bot runs 24/7 and only the operator can stop it (Ctrl+C).
+
+    Returns a Unix-timestamp deadline the loop must check, or None when the
+    loop must not stop on its own.
+    """
+    seconds = int(cfg.get("run_for_seconds", 0) or 0)
+    if cfg.get("demo_mode") and seconds > 0:
+        # TEST-ONLY timer: a local DEMO run may stop itself.
+        log.info("TEST RUN: will stop automatically after %ds (RUN_FOR_SECONDS).",
+                 seconds)
+        return time.time() + seconds
+    if seconds > 0:
+        # PRODUCTION GUARANTEE: the timer is fully ignored here - there is no
+        # code path that can stop the loop in production mode. Only Ctrl+C or
+        # killing the process can end it.
+        log.warning("RUN_FOR_SECONDS=%d is IGNORED in production mode - the bot "
+                    "runs 24/7 until you press Ctrl+C.", seconds)
+    return None
 
 
 def plan_market_buy(price: float, quote_free: float, *, order_size_quote: float,
@@ -1115,23 +1241,209 @@ def trailing_stop_level(entry_price: float, highest_price: float,
     return peak * (1.0 - trail / 100.0)
 
 
+def trailing_stop_armed(entry_price: float, highest_price: float,
+                        arm_pct: float = 0.5) -> bool:
+    """
+    True once the trailing stop may fire at all.
+
+    A trailing stop is a *profit-locking* rule, so on a straight decline a
+    trailing stop tighter than the DCA/stop-loss grid would otherwise close the
+    trade before the DCA trigger or the hard stop is ever reached. The stop
+    therefore only arms after the post-entry peak has climbed `arm_pct` above
+    the entry (default 0.5%). With TRAILING_STOP_PCT=0 nothing trails anyway.
+    """
+    if not entry_price or entry_price <= 0:
+        return False
+    peak = float(highest_price or entry_price)
+    return peak >= float(entry_price) * (1.0 + max(0.0, float(arm_pct or 0.0)) / 100.0)
+
+
 def trailing_stop_hit(entry_price: float, highest_price: float,
-                      current_price: float, trail_pct: float) -> bool:
+                      current_price: float, trail_pct: float,
+                      arm_pct: float = 0.5) -> bool:
     """
     True once current_price has dropped `trail_pct` below its post-entry peak.
 
     A trailing stop is a *profit-locking* risk rule: while the price rises the
     tight stop-loss is dragged up behind it, so a pullback that reaches the
     running peak minus trail_pct closes the position instead of giving back the
-    whole win. Returns False when there is nothing to trail (< initial entry).
+    whole win. It only counts once it is armed (see trailing_stop_armed), i.e.
+    after the price really went up, so it never pre-empts the DCA or the fixed
+    stop-loss on the way down. Returns False when there is nothing to trail.
     """
     trail = max(0.0, float(trail_pct or 0.0))
     if trail <= 0:
         return False
     if not current_price or current_price <= 0 or not entry_price or entry_price <= 0:
         return False
+    if not trailing_stop_armed(entry_price, highest_price, arm_pct):
+        return False
     level = trailing_stop_level(entry_price, highest_price, trail_pct)
     return level > 0 and current_price <= level
+
+
+def dca_trigger_level(avg_entry: float, dca_drop_pct: float) -> float:
+    """
+    Price at which the next DCA (averaging-down) add is triggered.
+
+    The drop is measured against the *current average entry*, so every add
+    moves the next trigger down by the same percentage - a natural grid that
+    always requires a further `dca_drop_pct` decline before more money is
+    committed. Returns 0.0 when the level cannot be computed (0 = disabled).
+    """
+    drop = max(0.0, float(dca_drop_pct or 0.0))
+    if not avg_entry or avg_entry <= 0 or drop <= 0:
+        return 0.0
+    return float(avg_entry) * (1.0 - drop / 100.0)
+
+
+def plan_dca(price: float, *, avg_entry: float, qty: float, quote_free: float,
+             dca_drop_pct: float = 1.5, dca_size_quote: float = 10.0,
+             dca_count: int = 0, dca_max_entries: int = 2,
+             min_qty: float = 1e-8, step: float = 1e-8, min_cost: float = 0.0,
+             buffer_pct: float = 0.0, fee_rate: float = 0.0, tp_pct: float = 0.0,
+             sl_pct: float = 0.0, slippage_pct: float = 0.05,
+             position_cost: float = 0.0, max_position_quote: float = 0.0,
+             quote: str = "USDT", base: str = "BASE") -> dict:
+    """
+    Decide whether the open position should be averaged down right now.
+
+    Pure function (no exchange access), so the DCA rules stay unit-testable and
+    the single-symbol bot and the multi-coin scanner obey exactly the same
+    maths. It is only ever *asked* while a position is open, and it answers one
+    question: "should I buy MORE at this price instead of being stopped out?"
+
+    An add is offered when ALL of the following hold:
+        * DCA is enabled and this position still has entries left,
+        * price <= average entry * (1 - dca_drop_pct/100),
+        * the hard stop-loss has NOT been broken yet (averaging into a trade
+          that already gave up its stop is how accounts die),
+        * the per-position cap (DCA_MAX_POSITION_QUOTE) and the free balance
+          still allow at least the exchange minimum notional.
+
+    Returned dict:
+        ok            - True when the add may be sent
+        added         - alias of ok (reads better in log lines)
+        trigger       - True when the price really is at/below the DCA level
+        reason/hint   - human readable why not (empty when ok)
+        level         - the trigger price for the *next* add
+        drop_pct      - current price distance below the average entry (%)
+        spend/qty/notional - the add (lot rounded, minNotional checked)
+        new_qty/new_entry/new_cost - the position after the add
+        new_tp/new_sl - TP/SL recomputed from the new average entry
+        dca_count/max_entries - how many adds will have been used
+    """
+    max_entries = max(0, int(dca_max_entries or 0))
+    size = max(0.0, float(dca_size_quote or 0.0))
+    drop = max(0.0, float(dca_drop_pct or 0.0))
+    old_qty = max(0.0, float(qty or 0.0))
+    old_entry = float(avg_entry or 0.0)
+    old_cost = max(0.0, float(position_cost or 0.0)) or old_qty * old_entry
+    count = max(0, int(dca_count or 0))
+    plan = {
+        "ok": False, "added": False, "trigger": False, "reason": "", "hint": "",
+        "warn": "", "level": dca_trigger_level(old_entry, drop), "drop_pct": 0.0,
+        "spend": 0.0, "qty": 0.0, "notional": 0.0,
+        "new_qty": old_qty, "new_entry": old_entry, "new_cost": old_cost,
+        "new_tp": 0.0, "new_sl": 0.0,
+        "dca_count": count, "max_entries": max_entries,
+    }
+    if max_entries <= 0 or size <= 0 or drop <= 0:
+        plan["reason"] = "DCA is disabled"
+        return plan
+    if old_entry <= 0 or old_qty <= 0:
+        plan["reason"] = "no tracked position to average down"
+        return plan
+    if not price or price <= 0:
+        plan["reason"] = "no valid price available"
+        return plan
+
+    level = plan["level"]
+    plan["trigger"] = price <= level
+    if not plan["trigger"]:
+        plan["reason"] = (f"price {price:,.2f} is above the DCA level "
+                          f"{level:,.2f} (-{drop:g}% of {old_entry:,.2f})")
+        return plan
+
+    plan["drop_pct"] = (old_entry / price - 1.0) * 100.0
+    if count >= max_entries:
+        plan["reason"] = f"all {max_entries} DCA entr(ies) already used"
+        return plan
+    # Never add money to a trade that has already broken its hard stop: that
+    # position is being closed instead of averaged down.
+    if sl_pct and sl_pct > 0:
+        stop = old_entry * (1.0 - float(sl_pct) / 100.0)
+        if price <= stop:
+            plan["reason"] = (f"price {price:,.2f} already broke the -"
+                              f"{float(sl_pct):g}% stop-loss {stop:,.2f} - no "
+                              f"averaging into a broken trade")
+            return plan
+
+    budget = size
+    if max_position_quote and max_position_quote > 0:
+        room = float(max_position_quote) - old_cost
+        if room <= 0:
+            plan["reason"] = (f"position already holds {old_cost:,.2f} {quote} "
+                              f"(DCA_MAX_POSITION_QUOTE="
+                              f"{float(max_position_quote):,.2f})")
+            return plan
+        budget = min(budget, room)
+    free = max(0.0, float(quote_free or 0.0))
+    if free <= 0:
+        plan["reason"] = "free balance is 0"
+        plan["hint"] = "wait for an exit, or lower DCA_SIZE_QUOTE"
+        return plan
+    plan["spend"] = min(budget, free)
+
+    # Size the add with exactly the same rules as a first entry: lot step,
+    # minNotional bump, minQty / minNotional refusal with an exact message.
+    # `free` (the real balance) is passed as quote_free on purpose: the
+    # minNotional bump must be allowed to buy the *next lot* up within the free
+    # balance, otherwise an add that sits exactly on minNotional (10 USDT) is
+    # refused by the very rounding it was meant to fix.
+    buy = plan_market_buy(
+        price, free, order_size_quote=plan["spend"], min_qty=min_qty,
+        step=step, min_cost=min_cost, buffer_pct=buffer_pct, fee_rate=fee_rate,
+        tp_pct=tp_pct, sl_pct=sl_pct, slippage_pct=slippage_pct,
+        require_exit_viable=False, quote=quote, base=base)
+    if not buy["ok"]:
+        plan["reason"] = f"DCA add refused: {buy['reason']}"
+        plan["hint"] = buy["hint"]
+        return plan
+
+    plan.update({
+        "ok": True, "added": True, "warn": buy["warn"], "qty": buy["qty"],
+        "notional": buy["notional"], "dca_count": count + 1,
+    })
+    plan["new_qty"] = old_qty + plan["qty"]
+    plan["new_cost"] = old_cost + plan["notional"]
+    if plan["new_qty"] > 0:
+        plan["new_entry"] = plan["new_cost"] / plan["new_qty"]
+    if tp_pct:
+        plan["new_tp"] = plan["new_entry"] * (1.0 + float(tp_pct) / 100.0)
+    if sl_pct:
+        plan["new_sl"] = plan["new_entry"] * (1.0 - float(sl_pct) / 100.0)
+    return plan
+
+
+def normalize_symbol(raw: str, quote: str = "USDT") -> str:
+    """
+    Turn a user-typed pair into ccxt unified notation ("BTC/USDT").
+
+    Accepts "BTC/USDT", "btc/usdt", "BTCUSDT" and "BTC-USDT" - the classic
+    Binance name - so a SCANNER_SYMBOLS list like ["BTCUSDT","ETHUSDT"] works
+    out of the box. Anything that is not built from the quote currency is
+    returned unchanged (the caller then simply won't find it in the markets).
+    """
+    if not raw:
+        return ""
+    text = str(raw).strip().upper().replace("-", "/").replace("_", "/")
+    quote = (quote or "USDT").upper()
+    if "/" in text:
+        return text
+    if quote and text.endswith(quote) and len(text) > len(quote):
+        return f"{text[:-len(quote)]}/{quote}"
+    return text
 
 
 def discover_spot_usdt_symbols(markets, quote: str = "USDT",
@@ -1202,6 +1514,20 @@ class BinanceTestnetBot:
         self.fee_rate = effective_fee_rate(self.fee_rate, self.bnb_discount_pct)
         # Trailing-stop distance (%). 0 = classic fixed stop-loss only.
         self.trailing_stop_pct = max(0.0, float(cfg.get("trailing_stop_pct", 0.0) or 0.0))
+        # The trail only arms after the peak rose this % above the entry.
+        self.trailing_arm_pct = max(0.0, float(cfg.get("trailing_arm_pct", 0.5) or 0.0))
+        # DCA / averaging down: a position that falls dca_drop_pct below its
+        # current average entry buys dca_size_quote more instead of being
+        # stopped out immediately (see plan_dca for the guard rails).
+        self.dca_enabled = bool(cfg.get("dca_enabled", False))
+        self.dca_drop_pct = max(0.0, float(cfg.get("dca_drop_pct", 1.5) or 0.0))
+        self.dca_size_quote = max(0.0, float(cfg.get("dca_size_quote", 0.0) or 0.0))
+        self.dca_max_entries = max(0, int(cfg.get("dca_max_entries", 0) or 0))
+        self.dca_max_position_quote = max(
+            0.0, float(cfg.get("dca_max_position_quote", 0.0) or 0.0))
+        # Optional RSI entry filter on top of the ADX gate (0 = off).
+        self.rsi_max_entry = max(0.0, float(cfg.get("rsi_max_entry", 0.0) or 0.0))
+        self.rsi_min_entry = max(0.0, float(cfg.get("rsi_min_entry", 0.0) or 0.0))
         self.last_signal_candle = None   # avoid re-trading the same candle
         self.failures = 0                # for exponential backoff
         self.avg_entry_price = None      # last BUY fill price (for Telegram P/L)
@@ -1365,6 +1691,18 @@ class BinanceTestnetBot:
                 "Raise TAKE_PROFIT_PCT or lower the fee/slippage assumptions.",
                 self.cfg["take_profit_pct"], rr["cost_pct"],
             )
+        if self.dca_enabled and self.dca_max_entries > 0 and self.dca_drop_pct > 0:
+            self.log.info(
+                "DCA on: up to %d add(s) of %.4f %s at -%g%% below the average "
+                "entry | per-coin cap %s | first trigger from %.2f is %.2f",
+                self.dca_max_entries, self.dca_size(), quote, self.dca_drop_pct,
+                (f"{self.dca_max_position_quote:,.2f} {quote}"
+                 if self.dca_max_position_quote > 0
+                 else "none (free balance only)"),
+                price, dca_trigger_level(price, self.dca_drop_pct))
+        else:
+            self.log.info("DCA off (set DCA_ENABLED=true to average down "
+                          "instead of being stopped out immediately).")
         if self.min_cost and quote_free < need:
             self.log.warning(
                 "Free balance %.4f %s is below the ~%.2f %s this pair needs for a "
@@ -1525,6 +1863,19 @@ class BinanceTestnetBot:
             )
             balance_txt = "unavailable"
         rr = self._net_rr()
+        trail_txt = (f"Trailing stop: -{self.trailing_stop_pct:g}% from the peak "
+                     f"(arms above +{self.trailing_arm_pct:g}%)"
+                     if self.trailing_stop_pct > 0 else "Trailing stop: off")
+        dca_txt = ("DCA: off"
+                   if not (self.dca_enabled and self.dca_max_entries > 0)
+                   else f"DCA: up to {self.dca_max_entries} add(s) of "
+                        f"{self.dca_size():,.2f} {quote} at "
+                        f"-{self.dca_drop_pct:g}% (per-coin cap "
+                        f"{self.dca_max_position_quote:,.2f} {quote})")
+        rsi_gate = (f"RSI filter: {self.rsi_min_entry:g} < RSI < "
+                    f"{self.rsi_max_entry:g}"
+                    if (self.rsi_min_entry > 0 or self.rsi_max_entry > 0)
+                    else "RSI filter: off")
         self.tg.send(
             "🤖 Trading bot started\n"
             f"Mode: {mode}\n"
@@ -1535,6 +1886,9 @@ class BinanceTestnetBot:
             f"(BUY only when ADX > {cfg['adx_threshold']:g})\n"
             f"Risk: Take-Profit +{cfg['take_profit_pct']:g}% / "
             f"Stop-Loss -{cfg['stop_loss_pct']:g}%\n"
+            f"{trail_txt}\n"
+            f"{dca_txt}\n"
+            f"{rsi_gate}\n"
             f"Net after costs: win +{rr['net_win_pct']:.2f}% / loss "
             f"-{rr['net_loss_pct']:.2f}% -> R:R {rr['rr']:.2f}\n"
             f"Risk gates: daily loss {cfg['max_daily_loss_pct']:g}%, "
@@ -1612,24 +1966,76 @@ class BinanceTestnetBot:
         return ("TP: {:,.2f} (+{:g}%) | SL: {:,.2f} (-{:g}%)".format(
             tp, self.cfg["take_profit_pct"], sl, self.cfg["stop_loss_pct"]))
 
-    def _tp_sl_exit_reason(self, price: float):
-        """
-        Return the exit reason once the live price hits a hard level:
-        'TAKE-PROFIT ...' / 'STOP-LOSS ...' (None while inside the bracket).
-        The level is included so the log and the Telegram message say exactly
-        which rule fired.
-        """
+    def _tp_exit_reason(self, price: float):
+        """'TAKE-PROFIT ...' once the live price reached the hard target."""
         if not self.avg_entry_price or self.avg_entry_price <= 0:
             return None
-        tp, sl = self._tp_sl_levels(self.avg_entry_price)
-        if price >= tp:
+        tp, _ = self._tp_sl_levels(self.avg_entry_price)
+        if tp and price >= tp:
             return (f"TAKE-PROFIT +{self.cfg['take_profit_pct']:g}% hit "
                     f"(target {tp:,.2f})")
-        if price <= sl:
+        return None
+
+    def _stop_loss_exit_reason(self, price: float):
+        """'STOP-LOSS ...' once the live price reached the hard stop."""
+        if not self.avg_entry_price or self.avg_entry_price <= 0:
+            return None
+        _, sl = self._tp_sl_levels(self.avg_entry_price)
+        if sl and price <= sl:
             return (f"STOP-LOSS -{self.cfg['stop_loss_pct']:g}% hit "
                     f"(stop {sl:,.2f})")
         return None
-        return None
+
+    def _trailing_exit_reason(self, price: float):
+        """
+        'TRAILING-STOP ...' once the price retraced below the raised stop.
+
+        The post-entry peak is updated on every poll (even before the trail is
+        armed), so the stop always trails the real high of the position. The
+        trail only arms after the peak climbed TRAILING_ARM_PCT above the
+        average entry, which keeps it a pure profit-lock and lets the DCA /
+        stop-loss rules own the way down.
+        """
+        if self.trailing_stop_pct <= 0 or not self.avg_entry_price:
+            return None
+        pos = self.position
+        if not pos:
+            return None
+        prev_peak = float(pos.get("trail_peak") or self.avg_entry_price)
+        peak = max(prev_peak, price)
+        pos["trail_peak"] = peak
+        if not trailing_stop_hit(self.avg_entry_price, prev_peak, price,
+                                 self.trailing_stop_pct, self.trailing_arm_pct):
+            return None
+        level = trailing_stop_level(self.avg_entry_price, peak,
+                                    self.trailing_stop_pct)
+        return (f"TRAILING-STOP -{self.trailing_stop_pct:g}% hit "
+                f"(peak {peak:,.2f} -> stop {level:,.2f})")
+
+    def _tp_sl_exit_reason(self, price: float):
+        """
+        Full hard-bracket check: 'TAKE-PROFIT ...' / 'STOP-LOSS ...' or None.
+
+        Kept as one call for the log/smoke-test contract; the tick loop uses the
+        split `_tp_exit_reason` / `_stop_loss_exit_reason` helpers so the DCA
+        step can sit between the two.
+        """
+        return self._tp_exit_reason(price) or self._stop_loss_exit_reason(price)
+
+    def _close_now(self, price: float, base_free: float, candle_ts,
+                   reason: str) -> None:
+        """
+        Close the open position with `reason` and mark the candle as handled.
+
+        A STOP-LOSS / TRAILING-STOP exit also starts the re-entry cooldown so
+        the bot does not immediately buy back into the chop that just stopped
+        it out. A TAKE-PROFIT exit needs no cooldown.
+        """
+        self.log.info("%s -> closing position @ %.2f", reason, price)
+        self.place_sell(price, base_free, reason=reason)
+        self.last_signal_candle = candle_ts
+        if reason.startswith(("STOP-LOSS", "TRAILING-STOP")):
+            self.last_loss_candle = candle_ts
 
     @staticmethod
     def _adx_display(adx_value) -> str:
@@ -1715,14 +2121,19 @@ class BinanceTestnetBot:
             "sl_exit_notional": plan["sl_exit_notional"],
             "exit_notional_ok": plan["exit_notional_ok"],
             "trail_peak": price,               # highest price since entry (trailing stop)
+            # DCA bookkeeping: how many adds the position received, the extra
+            # quote they cost, and the candle/price of the last add (at most one
+            # add per candle).
+            "dca_count": 0, "dca_spent": 0.0,
+            "dca_last_ts": None, "dca_last_price": None,
         }
 
         if self.exchange is None:  # demo
             self.paper_usdt -= notional                     # spend quote currency
             self.paper_btc += qty * (1.0 - self.fee_rate)   # receive base minus fee
             self.log.info(
-                ">> DEMO BUY %s qty=%.8f @ %,.2f (cost %.4f %s)%s",
-                self.cfg["symbol"], qty, price, notional, quote,
+                ">> DEMO BUY %s qty=%.8f @ %s (cost %.4f %s)%s",
+                self.cfg["symbol"], qty, f"{price:,.2f}", notional, quote,
                 " [lot bumped up to pass minNotional]" if plan["bumped"] else "",
             )
             self._register_position(position)
@@ -1770,8 +2181,136 @@ class BinanceTestnetBot:
             f"(needs > {self.cfg['adx_threshold']:g}) | RSI {rsi_txt}",
             self._stats_line(quote),
         ]
+        if self.dca_enabled and self.dca_max_entries > 0 and self.dca_drop_pct > 0:
+            level = dca_trigger_level(entry, self.dca_drop_pct)
+            lines.insert(
+                5, f"DCA: up to {self.dca_max_entries} add(s) of "
+                   f"{self.dca_size():,.2f} {quote} at -{self.dca_drop_pct:g}% "
+                   f"(first trigger {level:,.2f}) instead of an immediate "
+                   f"stop-out")
         if not position["exit_notional_ok"]:
             lines.insert(5, "⚠️ stop-loss exit may fall below minNotional (dust risk)")
+        return "\n".join(lines)
+
+    # -- DCA / averaging down --------------------------------------------------
+    def dca_size(self) -> float:
+        """Quote amount spent on one DCA add (0 -> ORDER_SIZE_QUOTE)."""
+        return max(0.0, float(self.dca_size_quote or self.cfg["order_size_quote"]))
+
+    def dca_plan(self, price: float, quote_free: float, candle_ts=None) -> dict:
+        """
+        Ask plan_dca() whether the open position should be averaged down now.
+
+        A no-op plan (ok=False) when DCA is disabled, the bot is flat, the price
+        is still above the trigger level, the DCA budget is used up or the
+        position was already averaged down on this same candle.
+        """
+        pos = self.position or {}
+        base, quote = self.cfg["symbol"].split("/")
+        plan = plan_dca(
+            price,
+            avg_entry=self.avg_entry_price or 0.0,
+            qty=pos.get("qty") or 0.0,
+            quote_free=quote_free,
+            dca_drop_pct=self.dca_drop_pct,
+            dca_size_quote=self.dca_size(),
+            dca_count=pos.get("dca_count") or 0,
+            dca_max_entries=self.dca_max_entries,
+            min_qty=self.min_qty, step=self.step, min_cost=self.min_cost,
+            buffer_pct=self.cfg["min_notional_buffer_pct"],
+            fee_rate=self.fee_rate,
+            tp_pct=self.cfg["take_profit_pct"],
+            sl_pct=self.cfg["stop_loss_pct"],
+            slippage_pct=self.cfg["slippage_pct"],
+            position_cost=pos.get("cost") or 0.0,
+            max_position_quote=self.dca_max_position_quote,
+            quote=quote, base=base,
+        )
+        if plan["ok"] and candle_ts is not None and pos.get("dca_last_ts") == candle_ts:
+            plan["ok"] = False
+            plan["added"] = False
+            plan["reason"] = "already averaged down on this candle"
+        return plan
+
+    def apply_dca(self, price: float, plan: dict, candle_ts=None) -> bool:
+        """
+        Send the DCA market buy and fold it into the tracked position.
+
+        The position keeps its trade id, so the journal shows one trade that was
+        averaged down: quantity and cost grow, the average entry - and with it
+        the TP/SL bracket - is recomputed, `dca_count` is bumped and the next
+        trigger automatically sits dca_drop_pct below the new average. Returns
+        True when the add was really sent.
+        """
+        pos = self.position
+        if not pos or not plan.get("ok"):
+            return False
+        base, quote = self.cfg["symbol"].split("/")
+        qty = plan["qty"]
+        if self.exchange is not None:
+            # Rounding must never slip below the exchange minimum.
+            qty = float(self.exchange.amount_to_precision(self.cfg["symbol"], qty))
+            if qty < self.min_qty or (self.min_cost and qty * price < self.min_cost):
+                self.log.warning(
+                    "DCA skipped: exchange rounding left qty=%.8f (%.4f %s) below "
+                    "the symbol minimum", qty, qty * price, quote)
+                return False
+        old_entry, old_qty = float(pos["entry"]), float(pos["qty"])
+        if self.exchange is None:  # demo
+            self.paper_usdt -= qty * price
+            self.paper_btc += qty * (1.0 - self.fee_rate)
+            fill_price, fill_qty = price, qty
+        else:
+            order = self.exchange.create_market_buy_order(self.cfg["symbol"], qty)
+            fill_price = float(order.get("average") or order.get("price") or price)
+            fill_qty = float(order.get("amount") or qty)
+        add_cost = fill_price * fill_qty
+        pos["qty"] = old_qty + fill_qty
+        pos["cost"] = float(pos.get("cost") or old_qty * old_entry) + add_cost
+        pos["entry"] = (pos["cost"] / pos["qty"]) if pos["qty"] > 0 else old_entry
+        pos["dca_count"] = int(pos.get("dca_count") or 0) + 1
+        pos["dca_spent"] = float(pos.get("dca_spent") or 0.0) + add_cost
+        pos["dca_last_ts"] = candle_ts
+        pos["dca_last_price"] = fill_price
+        tp, sl = self._tp_sl_levels(pos["entry"])
+        pos["tp"], pos["sl"] = tp, sl
+        self.avg_entry_price = pos["entry"]   # TP/SL + P/L anchor
+        self.log.info(
+            ">> DCA #%d %s added %.8f @ %s (%s %s) | avg entry %s -> %s | %s",
+            pos["dca_count"], self.cfg["symbol"], fill_qty, f"{fill_price:,.2f}",
+            f"{add_cost:,.4f}", quote, f"{old_entry:,.2f}",
+            f"{float(pos['entry']):,.2f}", self._tp_sl_text())
+        self.tg.send(self._dca_message(pos, fill_price, fill_qty, add_cost,
+                                       old_entry, plan, quote, base,
+                                       demo=self.exchange is None))
+        return True
+
+    def _dca_message(self, pos: dict, fill_price: float, fill_qty: float,
+                     add_cost: float, old_entry: float, plan: dict, quote: str,
+                     base: str, demo: bool) -> str:
+        """Self-contained Telegram card for a DCA add (trade-journal note)."""
+        new_entry = float(pos["entry"])
+        avg_move = (new_entry / old_entry - 1.0) * 100.0 if old_entry else 0.0
+        upnl = (fill_price / new_entry - 1.0) * 100.0 if new_entry else 0.0
+        upnl_quote = (fill_price - new_entry) * float(pos["qty"])
+        rsi_txt = ("n/a" if pos.get("rsi") is None
+                   else format(float(pos["rsi"]), ".1f"))
+        left = max(0, int(self.dca_max_entries) - int(pos.get("dca_count") or 0))
+        lines = [
+            (f"DCA #{pos['dca_count']}/{self.dca_max_entries}"
+             f"{' (DEMO)' if demo else ''} - {self.cfg['symbol']} #{pos.get('id')}"),
+            (f"Trigger: price {fill_price:,.2f} is -{plan.get('drop_pct', 0.0):.2f}% "
+             f"below the average entry (DCA_DROP_PERCENT={self.dca_drop_pct:g}%)"),
+            (f"Added: {fill_qty:.8f} {base} @ {fill_price:,.2f} "
+             f"(cost {add_cost:,.4f} {quote})"),
+            (f"Avg entry: {old_entry:,.2f} -> {new_entry:,.2f} ({avg_move:+.2f}%) | "
+             f"position size {float(pos['cost']):,.4f} {quote}"),
+            self._tp_sl_text(),
+            (f"Unrealised: {upnl_quote:+.4f} {quote} ({upnl:+.2f}%) | DCA left: "
+             f"{left} | filters ADX {self._adx_display(pos.get('entry_adx'))} "
+             f"RSI {rsi_txt}"),
+            self._stats_line(quote),
+        ]
         return "\n".join(lines)
 
     def place_sell(self, price: float, base_free: float,
@@ -1812,8 +2351,8 @@ class BinanceTestnetBot:
             self.paper_usdt += qty * price * (1.0 - self.fee_rate)  # minus fee
             pl_txt = self._close_position_pl(price, qty, quote, reason)
             self.log.info(
-                ">> DEMO SELL %s qty=%.8f @ %,.2f (position closed) | reason=%s",
-                self.cfg["symbol"], qty, price, reason,
+                ">> DEMO SELL %s qty=%.8f @ %s (position closed) | reason=%s",
+                self.cfg["symbol"], qty, f"{price:,.2f}", reason,
             )
             self.tg.send(self._sell_message(price, qty, quote, base, reason,
                                             tp_sl_txt, pl_txt, demo=True))
@@ -1904,6 +2443,7 @@ class BinanceTestnetBot:
             signal_df = df.iloc[:-1] if closed_only else df
             signal, rsi_now, adx_now, reason = current_signal(
                 df, self.cfg["adx_threshold"], closed_only=closed_only,
+                rsi_max=self.rsi_max_entry, rsi_min=self.rsi_min_entry,
             )
 
             balances = self.get_balances()
@@ -1947,44 +2487,47 @@ class BinanceTestnetBot:
                 pos_txt, quote_free, quote, base_free, base, tp_txt, sl_txt,
             )
 
-            # 1) TP / SL risk management: checked against the LIVE price on every
-            #    poll (not just once per candle) while we hold a position whose
-            #    entry price we know. These are hard price limits and can fire in
-            #    the middle of a 5m candle, so they run independent of the
-            #    once-per-candle indicator gating below.
-            tp_sl_hit = None
-            if in_position and self.avg_entry_price and self.avg_entry_price > 0:
-                tp_sl_hit = self._tp_sl_exit_reason(price)
-                if self.trailing_stop_pct > 0 and tp_sl_hit is None:
-                    # Trailing stop: drag the stop up behind a rising peak and lock
-                    # in profit on a pullback from that peak (only when the fixed
-                    # TP/SL has not already fired).
-                    prev_peak = float((self.position or {}).get("trail_peak")
-                                      or self.avg_entry_price)
-                    self.position["trail_peak"] = max(prev_peak, price)
-                    if trailing_stop_hit(self.avg_entry_price, prev_peak, price,
-                                         self.trailing_stop_pct):
-                        level = trailing_stop_level(
-                            self.avg_entry_price, max(prev_peak, price),
-                            self.trailing_stop_pct)
-                        tp_sl_hit = (f"TRAILING-STOP -{self.trailing_stop_pct:g}% hit "
-                                     f"(peak {max(prev_peak, price):,.2f} -> "
-                                     f"stop {level:,.2f})")
+            # Risk management, in strict priority order. Every price level is
+            # checked against the LIVE price on every poll (they can fire in the
+            # middle of a 5m candle), independently of the once-per-candle
+            # indicator gating further down:
+            #   1. hard Take-Profit         -> close (profit is always taken)
+            #   2. trailing stop (if armed) -> close (profit is locked in)
+            #   3. DCA add (if enabled)     -> buy more instead of stopping out
+            #   4. hard Stop-Loss           -> close
+            #   5. EMA entry/exit signal    -> once per candle
+            tracked = bool(in_position and self.avg_entry_price
+                           and self.avg_entry_price > 0)
+            handled = False
+            if tracked:
+                exit_reason = self._tp_exit_reason(price)
+                if exit_reason is None:
+                    exit_reason = self._trailing_exit_reason(price)
+                if exit_reason:
+                    self._close_now(price, base_free, candle_ts, exit_reason)
+                    handled = True
+                elif self.dca_enabled:
+                    plan = self.dca_plan(price, quote_free, candle_ts)
+                    if plan["ok"]:
+                        if self.apply_dca(price, plan, candle_ts):
+                            # If the drop was deeper than the add could
+                            # compensate for, the recomputed stop still fires.
+                            after = self._tp_sl_exit_reason(price)
+                            if after:
+                                self._close_now(price, base_free, candle_ts, after)
+                            handled = True
+                    elif plan["trigger"]:
+                        self.log.info("DCA not taken: %s", plan["reason"])
 
-            if tp_sl_hit:
-                self.log.info("%s -> closing position @ %.2f", tp_sl_hit, price)
-                was_stop = tp_sl_hit.startswith("STOP-LOSS") or tp_sl_hit.startswith("TRAILING-STOP")
-                self.place_sell(price, base_free, reason=tp_sl_hit)
-                self.last_signal_candle = candle_ts  # don't also re-act this candle
-                if was_stop:
-                    # Start the cooldown so the bot does not immediately re-enter
-                    # the same chop that just stopped it out.
-                    self.last_loss_candle = candle_ts
-            else:
-                # 2) Indicator-driven entry/exit - still once per candle.
-                self._act_on_signal(signal, price, in_position, quote_free, base_free,
-                                    df, adx_now=adx_now, rsi_now=rsi_now,
-                                    candle_ts=candle_ts)
+            if not handled:
+                stop_hit = self._stop_loss_exit_reason(price) if tracked else None
+                if stop_hit:
+                    self._close_now(price, base_free, candle_ts, stop_hit)
+                else:
+                    # Indicator-driven entry/exit - still once per candle.
+                    self._act_on_signal(signal, price, in_position, quote_free,
+                                        base_free, df, adx_now=adx_now,
+                                        rsi_now=rsi_now, candle_ts=candle_ts)
             if self.failures:
                 # A full tick succeeded again -> whatever broke has recovered.
                 self.tg.send(
@@ -2054,32 +2597,8 @@ class BinanceTestnetBot:
                 self.log.debug("exchange.close() failed (ignored): %s", err)
 
     def _run_deadline(self):
-        """
-        Shared RUN_FOR_SECONDS handling for run() and run_async().
-
-        RUN_FOR_SECONDS is a TEST-ONLY convenience: in DEMO_MODE the loop may
-        stop itself after N seconds. In production mode the limit is IGNORED -
-        the bot runs 24/7 and only the operator can stop it (Ctrl+C).
-        """
-        cfg = self.cfg
-        if cfg["demo_mode"] and cfg["run_for_seconds"] > 0:
-            # TEST-ONLY timer: a local DEMO run may stop itself.
-            self.log.info(
-                "TEST RUN: will stop automatically after %ds (RUN_FOR_SECONDS).",
-                cfg["run_for_seconds"],
-            )
-            return time.time() + cfg["run_for_seconds"]
-        if cfg["run_for_seconds"] > 0:
-            # PRODUCTION GUARANTEE: the timer is fully ignored here - there is
-            # no code path that can stop the loop in production mode. Only
-            # Ctrl+C (KeyboardInterrupt handled below) or killing the process
-            # can end it.
-            self.log.warning(
-                "RUN_FOR_SECONDS=%d is IGNORED in production mode - the bot "
-                "runs 24/7 until you press Ctrl+C.",
-                cfg["run_for_seconds"],
-            )
-        return None
+        """Shared RUN_FOR_SECONDS handling - see run_deadline()."""
+        return run_deadline(self.cfg, self.log)
 
     def run(self):
         """
@@ -2207,9 +2726,21 @@ class MultiCoinScanner:
         self.min_24h_quote = max(0.0, float(cfg.get("scan_min_24h_quote", 0.0) or 0.0))
         self.max_symbols = max(1, int(cfg.get("scan_max_symbols", 30) or 30))
         self.exclude = set((cfg.get("scan_exclude") or []))
-        self.explicit = [s.strip().upper() for s in
+        self.explicit = [normalize_symbol(s, self.quote) for s in
                          str(cfg.get("scanner_symbols", "")).split(",") if s.strip()]
         self.trailing_pct = max(0.0, float(cfg.get("trailing_stop_pct", 0.0) or 0.0))
+        self.trailing_arm_pct = max(0.0, float(cfg.get("trailing_arm_pct", 0.5) or 0.0))
+        # DCA / averaging down (same rules as the single-symbol bot; see
+        # plan_dca). Per position, so every coin has its own add budget.
+        self.dca_enabled = bool(cfg.get("dca_enabled", False))
+        self.dca_drop_pct = max(0.0, float(cfg.get("dca_drop_pct", 1.5) or 0.0))
+        self.dca_size_quote = max(0.0, float(cfg.get("dca_size_quote", 0.0) or 0.0))
+        self.dca_max_entries = max(0, int(cfg.get("dca_max_entries", 0) or 0))
+        self.dca_max_position_quote = max(
+            0.0, float(cfg.get("dca_max_position_quote", 0.0) or 0.0))
+        # Optional RSI entry filter (0 = off), same as the single-symbol bot.
+        self.rsi_max_entry = max(0.0, float(cfg.get("rsi_max_entry", 0.0) or 0.0))
+        self.rsi_min_entry = max(0.0, float(cfg.get("rsi_min_entry", 0.0) or 0.0))
         self.use_all_pct = max(0.0, float(cfg.get("use_all_balance_pct", 100.0) or 100.0))
         self.buffer_pct = max(0.0, float(cfg.get("min_notional_buffer_pct", 0.0) or 0.0))
         self.require_exit = bool(cfg.get("require_exit_viable", False))
@@ -2415,12 +2946,16 @@ class MultiCoinScanner:
                 "trail_peak": price, "opened_ts": time.time(),
                 "reason": reason, "adx": adx_now, "rsi": rsi_now,
                 "planned_rr": rr["rr"],
+                # DCA bookkeeping: adds received, extra quote spent, and the
+                # candle/price of the last add (at most one add per candle).
+                "dca_count": 0, "dca_spent": 0.0,
+                "dca_last_ts": None, "dca_last_price": None,
             }
         if self.exchange is None:
             self.paper_usdt -= notional
             self.paper_base[symbol.split("/")[0]] += qty * (1.0 - fee)
-            self.log.info(">> [scan] DEMO BUY %s qty=%.8f @ %,.2f (cost %.4f %s)",
-                          symbol, qty, price, notional, self.quote)
+            self.log.info(">> [scan] DEMO BUY %s qty=%.8f @ %s (cost %.4f %s)",
+                          symbol, qty, f"{price:,.2f}", notional, self.quote)
         else:
             order = self.exchange.create_market_buy_order(symbol, qty)
             fill_price = float(order.get("average") or order.get("price") or price)
@@ -2465,11 +3000,133 @@ class MultiCoinScanner:
                 "entry": entry, "exit": fill_price, "pnl_quote": pnl,
                 "reason": reason, "closed_ts": time.time(),
             })
-        self.log.info(">> [scan] SELL %s qty=%.8f @ %,.2f pnl=%+.4f %s | %s",
-                      symbol, fill_qty, fill_price, pnl, self.quote, reason)
+        self.log.info(">> [scan] SELL %s qty=%.8f @ %s pnl=%+.4f %s | %s",
+                      symbol, fill_qty, f"{fill_price:,.2f}", pnl, self.quote, reason)
         if pos:
             self._notify_trade("SELL", symbol, pos, pnl=pnl, reason=reason)
 
+    # -- DCA / averaging down --------------------------------------------------
+    def _dca_size(self) -> float:
+        """
+        Quote amount spent on one DCA add.
+
+        DCA_SIZE_QUOTE wins; when it is 0 the portfolio floor (one proportional
+        slot) is used so a small account still averages down with a properly
+        sized, minNotional-clearing order.
+        """
+        if self.dca_size_quote > 0:
+            return self.dca_size_quote
+        return max(0.0, float(self.floor_usdt or 0.0))
+
+    def _dca_plan(self, symbol: str, price: float, quote_free: float,
+                  candle_ts=None) -> dict:
+        """Ask plan_dca() whether this coin should be averaged down now."""
+        pos = self.positions.get(symbol) or {}
+        min_qty, min_cost, step = self.symbol_rules.get(symbol, (1e-8, 0.0, 1e-8))
+        base, _ = symbol.split("/")
+        plan = plan_dca(
+            price,
+            avg_entry=pos.get("entry") or 0.0,
+            qty=pos.get("qty") or 0.0,
+            quote_free=quote_free,
+            dca_drop_pct=self.dca_drop_pct,
+            dca_size_quote=self._dca_size(),
+            dca_count=pos.get("dca_count") or 0,
+            dca_max_entries=self.dca_max_entries,
+            min_qty=min_qty, step=step, min_cost=min_cost,
+            buffer_pct=self.buffer_pct, fee_rate=self._fee(),
+            tp_pct=self.cfg["take_profit_pct"], sl_pct=self.cfg["stop_loss_pct"],
+            slippage_pct=self.cfg["slippage_pct"],
+            position_cost=pos.get("cost") or 0.0,
+            max_position_quote=self.dca_max_position_quote,
+            quote=self.quote, base=base,
+        )
+        if plan["ok"] and candle_ts is not None and pos.get("dca_last_ts") == candle_ts:
+            plan["ok"] = False
+            plan["added"] = False
+            plan["reason"] = "already averaged down on this candle"
+        return plan
+
+    def _apply_dca(self, symbol: str, price: float, plan: dict,
+                   candle_ts=None) -> bool:
+        """
+        Send the DCA add for `symbol` and fold it into that coin's position.
+
+        The average entry (and therefore the TP/SL bracket) is recomputed, so
+        the position gets more room exactly like in the single-symbol bot.
+        Returns True when the add was really sent.
+        """
+        pos = self.positions.get(symbol)
+        if not pos or not plan.get("ok"):
+            return False
+        base, _ = symbol.split("/")
+        min_qty, min_cost, _step = self.symbol_rules.get(symbol, (1e-8, 0.0, 1e-8))
+        qty = plan["qty"]
+        if self.exchange is not None:
+            qty = float(self.exchange.amount_to_precision(symbol, qty))
+            if qty < min_qty or (min_cost and qty * price < min_cost):
+                self.log.warning(
+                    "[scan] DCA skip %s: exchange rounding left qty=%.8f below "
+                    "the symbol minimum", symbol, qty)
+                return False
+        old_entry, old_qty = float(pos["entry"]), float(pos["qty"])
+        if self.exchange is None:
+            self.paper_usdt -= qty * price
+            self.paper_base[base] = (self.paper_base.get(base, 0.0)
+                                     + qty * (1.0 - self._fee()))
+            fill_price, fill_qty = price, qty
+        else:
+            order = self.exchange.create_market_buy_order(symbol, qty)
+            fill_price = float(order.get("average") or order.get("price") or price)
+            fill_qty = float(order.get("amount") or qty)
+        add_cost = fill_price * fill_qty
+        with self.lock:
+            pos["qty"] = old_qty + fill_qty
+            pos["cost"] = float(pos.get("cost") or old_qty * old_entry) + add_cost
+            pos["entry"] = (pos["cost"] / pos["qty"]) if pos["qty"] > 0 else old_entry
+            pos["dca_count"] = int(pos.get("dca_count") or 0) + 1
+            pos["dca_spent"] = float(pos.get("dca_spent") or 0.0) + add_cost
+            pos["dca_last_ts"] = candle_ts
+            pos["dca_last_price"] = fill_price
+            pos["tp"], pos["sl"] = self._tp_sl_levels(pos["entry"])
+        self.log.info(
+            ">> [scan] DCA #%d %s added %.8f @ %s (%s %s) | avg entry %s -> %s"
+            " | new TP: %s SL: %s",
+            pos["dca_count"], symbol, fill_qty, f"{fill_price:,.2f}",
+            f"{add_cost:,.4f}", self.quote, f"{old_entry:,.2f}",
+            f"{float(pos['entry']):,.2f}", f"{float(pos['tp']):,.2f}",
+            f"{float(pos['sl']):,.2f}")
+        self._notify_dca(symbol, pos, fill_price, fill_qty, add_cost, old_entry,
+                         plan)
+        return True
+
+    def _notify_dca(self, symbol: str, pos: dict, fill_price: float,
+                    fill_qty: float, add_cost: float, old_entry: float,
+                    plan: dict) -> None:
+        """Optional Telegram card for a scanner DCA add (no-op when disabled)."""
+        if not self.tg.enabled:
+            return
+        try:
+            base, _ = symbol.split("/")
+            new_entry = float(pos["entry"])
+            avg_move = (new_entry / old_entry - 1.0) * 100.0 if old_entry else 0.0
+            upnl = (fill_price / new_entry - 1.0) * 100.0 if new_entry else 0.0
+            left = max(0, self.dca_max_entries - int(pos.get("dca_count") or 0))
+            body = [
+                f"DCA #{pos['dca_count']}/{self.dca_max_entries} [{symbol}] "
+                f"#{pos.get('id')}",
+                f"Trigger: {fill_price:,.2f} is -{plan.get('drop_pct', 0.0):.2f}% "
+                f"below the average entry (DCA_DROP_PERCENT={self.dca_drop_pct:g}%)",
+                f"Added: {fill_qty:.8f} {base} (cost {add_cost:,.4f} {self.quote})",
+                f"Avg entry: {old_entry:,.2f} -> {new_entry:,.2f} ({avg_move:+.2f}%)"
+                f" | position size {float(pos['cost']):,.4f} {self.quote}",
+                f"TP: {float(pos['tp']):,.2f} | SL: {float(pos['sl']):,.2f}",
+                f"Unrealised: {(fill_price - new_entry) * float(pos['qty']):+.4f} "
+                f"{self.quote} ({upnl:+.2f}%) | DCA left: {left}",
+            ]
+            self.tg.send("\n".join(body) + "\n" + self._stats_line())
+        except Exception as err:
+            self.log.debug("[telegram] scanner DCA card skipped: %s", err)
     def _fee(self) -> float:
         return effective_fee_rate(self.cfg.get("fee_rate", 0.001), self.bnb_discount_pct)
 
@@ -2482,9 +3139,21 @@ class MultiCoinScanner:
                       if kind == "BUY" else
                       f"🔴 SELL [{symbol}] #{pos.get('id')} - {reason}")
             rr = self._net_rr()
+            base, _ = symbol.split("/")
             body = [header, f"{symbol} @ {pos['entry']:,.2f}",
-                    f"Amount: {pos['qty']:.8f} {symbol.split('/')[0]}",
+                    f"Amount: {pos['qty']:.8f} {base} "
+                    f"(cost {float(pos.get('cost') or 0.0):,.4f} {self.quote})",
+                    f"TP: {float(pos['tp']):,.2f} (+{self.cfg['take_profit_pct']:g}%)"
+                    f" | SL: {float(pos['sl']):,.2f} (-{self.cfg['stop_loss_pct']:g}%)",
+                    f"Filters: ADX {self._fmt(pos.get('adx'))} "
+                    f"(needs > {self.cfg['adx_threshold']:g}) | "
+                    f"RSI {self._fmt(pos.get('rsi'))}",
                     f"Risk/reward R:R {rr['rr']:.2f} after costs"]
+            if kind == "BUY" and self.dca_enabled and self.dca_max_entries > 0:
+                body.insert(5, f"DCA: up to {self.dca_max_entries} add(s) of "
+                               f"{self._dca_size():,.2f} {self.quote} at "
+                               f"-{self.dca_drop_pct:g}% instead of an immediate "
+                               f"stop-out")
             if pnl is not None:
                 body.append(f"P/L: {pnl:+.4f} {self.quote}")
             self.tg.send("\n".join(body) + "\n" + self._stats_line())
@@ -2521,11 +3190,11 @@ class MultiCoinScanner:
                 deploy, parts=self.parts, floor_usdt=self.floor_usdt)
             per_part = prop["per_part"]
             self.log.info(
-                "[scan] free %,.4f %s | deploy %,.2f -> %d/%d part(s) @ %,.4f %s each "
-                "(reserved %,.4f by %d open)",
-                quote_free, self.quote, deploy, prop["usable_parts"], prop["parts"],
-                per_part, self.quote, reserved, len(self.positions)
-                if len(self.positions) else 0)
+                "[scan] free %s %s | deploy %s -> %d/%d part(s) @ %s %s each "
+                "(reserved %s by %d open)",
+                f"{quote_free:,.4f}", self.quote, f"{deploy:,.2f}",
+                prop["usable_parts"], prop["parts"], f"{per_part:,.4f}",
+                self.quote, f"{reserved:,.4f}", len(self.positions))
 
             snapshots = self._fetch_snapshots(self.symbols)
             for symbol in self.symbols:
@@ -2537,18 +3206,37 @@ class MultiCoinScanner:
                 df = compute_indicators(df, self.cfg)
                 closed_only = self.closed_only and len(df) > 2
                 signal, rsi, adx, _why = current_signal(
-                    df, self.cfg["adx_threshold"], closed_only=closed_only)
+                    df, self.cfg["adx_threshold"], closed_only=closed_only,
+                    rsi_max=self.rsi_max_entry, rsi_min=self.rsi_min_entry)
                 candle_ts = int(df["ts"].iloc[-1])
                 min_qty, min_cost, _ = self.symbol_rules.get(symbol, (1e-8, 0.0, 1e-8))
                 base_free = self.get_base_balance(symbol)
                 in_position = symbol in self.positions and base_free >= min_qty
 
-                # 1) exits first - never gated by anything.
+                # 1) Profit exits first (take-profit + trailing stop): never
+                #    gated by anything, and they always win over a DCA add.
                 if in_position:
-                    exit_reason = self._exit_reason(symbol, price, signal)
+                    exit_reason = self._exit_reason(symbol, price, signal,
+                                                    include_sl=False,
+                                                    include_ema=False)
+                    if exit_reason is None and self.dca_enabled:
+                        # 2) DCA: average down instead of stopping out. The hard
+                        #    stop is still untouched at this point (plan_dca
+                        #    refuses to add once it is broken).
+                        plan = self._dca_plan(symbol, price, quote_free, candle_ts)
+                        if plan["ok"]:
+                            self._apply_dca(symbol, price, plan, candle_ts)
+                        elif plan["trigger"]:
+                            self.log.info("[scan] DCA not taken %s: %s",
+                                          symbol, plan["reason"])
+                    if exit_reason is None:
+                        # 3) Hard stop-loss / EMA death cross - never gated, and
+                        #    re-evaluated against the recomputed bracket after an
+                        #    add (a crash deeper than the DCA can offset exits).
+                        exit_reason = self._exit_reason(symbol, price, signal)
                     if exit_reason:
-                        self._place_sell(symbol, price, self.positions[symbol]["qty"],
-                                         exit_reason)
+                        self._place_sell(symbol, price,
+                                         self.positions[symbol]["qty"], exit_reason)
                         self.last_signal_candle[symbol] = candle_ts
                     continue
 
@@ -2557,13 +3245,17 @@ class MultiCoinScanner:
                     continue
                 if self.last_signal_candle.get(symbol) == candle_ts:
                     continue
+                # `deploy` is the share of the balance this cycle may invest
+                # (USE_ALL_BALANCE_PCT), `reserved` is what the open positions
+                # already hold - so the rest stays free for DCA adds and fees
+                # instead of being fully invested.
                 available = max(0.0, quote_free - reserved)
                 budget = per_part if per_part > 0 else available
-                budget = min(budget, available)
+                budget = min(budget, available, max(0.0, deploy - reserved))
                 if budget < min_cost * (1.0 + self.buffer_pct / 100.0) and min_cost > 0:
                     self.log.info(
-                        "[scan] BUY skip %s: proportional part %,.4f %s < minNotional %s",
-                        symbol, budget, self.quote, f"{min_cost:,.2f}")
+                        "[scan] BUY skip %s: proportional part %s %s < minNotional %s",
+                        symbol, f"{budget:,.4f}", self.quote, f"{min_cost:,.2f}")
                     continue
                 self._place_buy(symbol, price, available, budget,
                                 adx_now=adx, rsi_now=rsi,
@@ -2584,26 +3276,37 @@ class MultiCoinScanner:
             self.log.exception("[scan] unexpected error (scanner keeps running): %s", err)
             self._recover("unexpected", err)
 
-    def _exit_reason(self, symbol: str, price: float, ema_signal: str) -> str:
-        """Close reason when a hard TP/SL/trailing level or an EMA SELL fires."""
+    def _exit_reason(self, symbol: str, price: float, ema_signal: str,
+                     include_sl: bool = True, include_ema: bool = True) -> str:
+        """
+        Close reason when a hard TP/SL/trailing level or an EMA SELL fires.
+
+        `include_sl` / `include_ema` let the scan cycle ask for the *profit*
+        exits only (take-profit + trailing stop) first: those always win over a
+        DCA add, while the stop-loss and the EMA death cross are evaluated right
+        after the add, against the recomputed bracket.
+        """
         pos = self.positions.get(symbol)
         if not pos or pos.get("entry") is None or pos["entry"] <= 0:
             return ""
         entry = pos["entry"]
         tp, sl = self._tp_sl_levels(entry)
-        if price >= tp:
-            return f"TAKE-PROFIT +{self.cfg['take_profit_pct']:g}% hit (target {tp:,.2f})"
-        if price <= sl:
-            return f"STOP-LOSS -{self.cfg['stop_loss_pct']:g}% hit (stop {sl:,.2f})"
+        if tp and price >= tp:
+            return (f"TAKE-PROFIT +{self.cfg['take_profit_pct']:g}% hit "
+                    f"(target {tp:,.2f})")
+        if include_sl and sl and price <= sl:
+            return (f"STOP-LOSS -{self.cfg['stop_loss_pct']:g}% hit "
+                    f"(stop {sl:,.2f})")
         if self.trailing_pct > 0:
             prev_peak = float(pos.get("trail_peak") or entry)
             pos["trail_peak"] = max(prev_peak, price)
-            if trailing_stop_hit(entry, prev_peak, price, self.trailing_pct):
+            if trailing_stop_hit(entry, prev_peak, price, self.trailing_pct,
+                                 self.trailing_arm_pct):
                 level = trailing_stop_level(entry, max(prev_peak, price),
                                             self.trailing_pct)
                 return (f"TRAILING-STOP -{self.trailing_pct:g}% hit "
                         f"(peak {max(prev_peak, price):,.2f} -> stop {level:,.2f})")
-        if ema_signal == "SELL":
+        if include_ema and ema_signal == "SELL":
             return "EMA death cross (fast crossed below slow)"
         return ""
 
@@ -2625,8 +3328,13 @@ class MultiCoinScanner:
         time.sleep(wait)
 
     def run(self):
-        """Blocking portfolio loop (classic entry point); Ctrl+C stops cleanly."""
+        """Blocking portfolio loop (classic entry point); Ctrl+C stops cleanly.
+
+        RUN_FOR_SECONDS is honoured exactly like in the single-symbol bot:
+        a DEMO run may stop itself, in production the timer is ignored.
+        """
         cfg = self.cfg
+        deadline = run_deadline(cfg, self.log)
         self.log.info("Scanner running. Polling %d symbol(s) every %ds. Ctrl+C to stop.",
                       len(self.symbols), cfg.get("scan_poll_seconds", 60))
         while True:
@@ -2636,17 +3344,24 @@ class MultiCoinScanner:
             except KeyboardInterrupt:
                 self.log.info("Keyboard interrupt received - shutting the scanner down.")
                 break
+            if deadline is not None and time.time() >= deadline:
+                self.log.info("TEST RUN over (RUN_FOR_SECONDS) - shutting down cleanly.")
+                break
 
     async def run_async(self):
         """Asyncio twin of run(): blocking scans run in a worker thread via
         loop.run_in_executor, so the event loop stays responsive while the
         scanner crawls many pairs."""
         cfg = self.cfg
+        deadline = run_deadline(cfg, self.log)
         loop = asyncio.get_running_loop()
         self.log.info("Scanner running (asyncio). Polling %d symbol(s) every %ds.",
                       len(self.symbols), cfg.get("scan_poll_seconds", 60))
         while True:
             await loop.run_in_executor(None, self._scan_once)
+            if deadline is not None and time.time() >= deadline:
+                self.log.info("TEST RUN over (RUN_FOR_SECONDS) - shutting down cleanly.")
+                return
             await asyncio.sleep(max(0.0, float(cfg.get("scan_poll_seconds", 60))))
 
     def close(self) -> None:
@@ -2716,6 +3431,26 @@ def main(use_async: bool = None) -> int:
              cfg["adx_threshold"])
     log.info("Risk     : Take-Profit +%g%% | Stop-Loss -%g%% (auto, exits always on)",
              cfg["take_profit_pct"], cfg["stop_loss_pct"])
+    if cfg["trailing_stop_pct"] > 0:
+        log.info("Trail    : -%g%% from the post-entry peak (arms above +%g%%)",
+                 cfg["trailing_stop_pct"], cfg["trailing_arm_pct"])
+    else:
+        log.info("Trail    : off (TRAILING_STOP_PCT=0)")
+    if cfg["dca_enabled"] and cfg["dca_max_entries"] > 0:
+        _q = cfg["symbol"].split("/")[1]
+        log.info("DCA      : up to %d add(s) of %g %s at -%g%% below the average "
+                 "entry | per-coin cap %s",
+                 cfg["dca_max_entries"],
+                 (cfg["dca_size_quote"] or cfg["order_size_quote"]), _q,
+                 cfg["dca_drop_pct"],
+                 (f"{cfg['dca_max_position_quote']:g} {_q}"
+                  if cfg["dca_max_position_quote"] > 0 else "free balance only"))
+    else:
+        log.info("DCA      : off")
+    log.info("RSI gate : %s", (
+        f"skip a BUY when RSI > {cfg['rsi_max_entry']:g}"
+        + (f" or RSI < {cfg['rsi_min_entry']:g}" if cfg["rsi_min_entry"] > 0 else "")
+        if (cfg["rsi_max_entry"] > 0 or cfg["rsi_min_entry"] > 0) else "off"))
     log.info("Risk caps: daily loss %g%% | %d losses in a row | %d candle(s) cooldown "
              "after a stop-out",
              cfg["max_daily_loss_pct"], cfg["max_consecutive_losses"],
@@ -2749,6 +3484,21 @@ def main(use_async: bool = None) -> int:
                  cfg["portfolio_parts"], cfg["scan_quote"], cfg["scan_quote"],
                  cfg["portfolio_floor_usdt"], cfg["scan_quote"],
                  cfg["bnb_fee_discount_pct"], cfg["trailing_stop_pct"])
+        _list = [normalize_symbol(s, cfg["scan_quote"]) for s in
+                 str(cfg["scanner_symbols"]).split(",") if s.strip()]
+        log.info("Coins    : %s",
+                 ", ".join(_list) if _list
+                 else f"dynamic discovery of every liquid /{cfg['scan_quote']} pair")
+        if cfg["dca_enabled"] and cfg["dca_max_entries"] > 0:
+            log.info("DCA      : up to %d add(s) of %g %s per coin at -%g%% below "
+                     "the average entry | per-coin cap %s",
+                     cfg["dca_max_entries"],
+                     (cfg["dca_size_quote"] or cfg["portfolio_floor_usdt"]),
+                     cfg["scan_quote"], cfg["dca_drop_pct"],
+                     (f"{cfg['dca_max_position_quote']:g} {cfg['scan_quote']}"
+                      if cfg["dca_max_position_quote"] > 0 else "free balance only"))
+        else:
+            log.info("DCA      : off")
         log_env_conflicts(log)
         try:
             scanner = MultiCoinScanner(cfg)

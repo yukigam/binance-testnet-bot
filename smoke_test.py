@@ -1,9 +1,11 @@
 """Quick smoke test for trading_bot.py - runs WITHOUT any network access."""
 import asyncio
+import ast
 import io
 import logging
 import math
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -160,13 +162,16 @@ check("demo SELL empties BTC (only sub-lot dust remains)",
 check("demo SELL returns USDT", bot.get_balances()["USDT"]["free"] > usdt)
 
 
-# --- 3b) 10 USDT balance: config, minNotional gate and fee residuals -----------
-# The bot is validated against a real 10 USDT testnet account, so the demo
-# must start at 10.00 USDT, reject BUYs below Binance's ~10 USDT minNotional,
-# refuse orders that cannot be exited, and still apply the 0.1% taker fee.
-cfg10 = t.load_config()  # reads .env (ORDER_SIZE_QUOTE=10, INITIAL_BALANCE_USDT=10.0)
+# --- 3b) Small account (10 USDT): minNotional gate and fee residuals -----------
+# The hardest case is a tiny account: the demo starts at exactly 10.00 USDT,
+# must reject BUYs below Binance's ~10 USDT minNotional, refuse orders that
+# cannot be exited, and still apply the 0.1% taker fee.
+# NOTE: these edge cases are pinned to 10.00 USDT so the test stays valid
+# whatever balance the .env is tuned for.
+cfg10 = dict(t.load_config(), initial_balance_usdt=10.0)
 check("config order size = 10 USDT", abs(cfg10["order_size_quote"] - 10.0) < 1e-9)
-check("config initial balance = 10 USDT", abs(cfg10["initial_balance_usdt"] - 10.0) < 1e-9)
+check("config initial balance = 50 USDT (the test balance)",
+      abs(t.load_config()["initial_balance_usdt"] - 50.0) < 1e-9)
 
 bot10 = t.BinanceTestnetBot(cfg10)
 bot10.tg = t.TelegramNotifier("", "", bot10.log)  # stay chat-quiet
@@ -188,14 +193,15 @@ check("10.00 USDT balance -> entry refused (rounded order < minNotional)",
 check("refusal names the balance this pair really needs",
       plan_edge["min_balance"] > 10.0 and "need about" in plan_edge["hint"])
 
-# NOTE: this symbol's minNotional is 10 USDT, so a 10.00 USDT order can never be
-# exited again (fees would push the sell below minNotional). 10.2 USDT is the
-# smallest budget that survives its own fees - exactly what the startup
-# "safe minimum account" line reports - so the exit test uses that account.
-exit_bot = t.BinanceTestnetBot(dict(cfg10, order_size_quote=10.2))
+# NOTE: this symbol's minNotional is 10 USDT, and the shipped .env brackets every
+# entry with a -2.5% stop, so an order sitting exactly on 10.00 USDT could never
+# be exited again (fees + the stop push the sell below minNotional). 11 USDT is
+# comfortably above the ~10.27 USDT this bracket really needs - exactly what the
+# startup "safe minimum account" line reports.
+exit_bot = t.BinanceTestnetBot(dict(cfg10, order_size_quote=11.0))
 exit_bot.tg = t.TelegramNotifier("", "", exit_bot.log)
-exit_bot.paper_usdt = 10.2          # the account was topped up to 10.2 USDT
-exit_bot.place_buy(60000.0, 10.2)
+exit_bot.paper_usdt = 11.0          # the account was topped up to 11.0 USDT
+exit_bot.place_buy(60000.0, 11.0)
 usdt_after_buy = exit_bot.get_balances()["USDT"]["free"]
 btc10 = exit_bot.get_balances()["BTC"]["free"]
 check("BUY accepted once the balance can pay for a minNotional-clearing order",
@@ -263,7 +269,9 @@ _saved_env = {k: os.environ.pop(k, None) for k in (
     "TAKE_PROFIT_PCT", "STOP_LOSS_PCT", "ADX_THRESHOLD", "ADX_PERIOD",
     "SLIPPAGE_PCT", "MIN_NOTIONAL_BUFFER_PCT", "REQUIRE_EXIT_VIABLE",
     "SIGNAL_ON_CLOSED_CANDLE", "MAX_DAILY_LOSS_PCT", "MAX_CONSECUTIVE_LOSSES",
-    "LOSS_COOLDOWN_CANDLES", "SELL_ONLY_TRACKED_QTY")}
+    "LOSS_COOLDOWN_CANDLES", "SELL_ONLY_TRACKED_QTY", "TRAILING_STOP_PCT",
+    "TRAILING_ARM_PCT", "DCA_ENABLED", "DCA_DROP_PERCENT", "DCA_SIZE_QUOTE",
+    "DCA_MAX_ENTRIES", "DCA_MAX_POSITION_QUOTE", "RSI_MAX_ENTRY", "RSI_MIN_ENTRY")}
 try:
     _def = t.load_config()
     check("defaults: TP +2.5% / SL -1.0%",
@@ -278,13 +286,20 @@ try:
            _def["loss_cooldown_candles"]) == (3.0, 3, 2))
     check("defaults: only the bot's own quantity is sold",
           _def["sell_only_tracked_qty"] is True)
+    check("defaults: trailing stop / DCA / RSI filter are opt-in (all off)",
+          (_def["trailing_stop_pct"], _def["dca_enabled"],
+           _def["rsi_max_entry"], _def["rsi_min_entry"]) == (0.0, False, 0.0, 0.0))
+    check("defaults: DCA grid -1.5% with 2 entries",
+          (_def["dca_drop_pct"], _def["dca_max_entries"]) == (1.5, 2))
+    check("defaults: the trailing stop arms +0.5% above the entry",
+          _def["trailing_arm_pct"] == 0.5)
 finally:
     os.environ.update({k: v for k, v in _saved_env.items() if v is not None})
 
 # -- Risk gates: protect the account, but never block an exit -------------------
-gate = t.BinanceTestnetBot(dict(cfg10, order_size_quote=10.2))
+gate = t.BinanceTestnetBot(dict(cfg10, order_size_quote=11.0))
 gate.tg = t.TelegramNotifier("", "", gate.log)   # chat-quiet no-op notifier
-gate.place_buy(60000.0, 10.2)
+gate.place_buy(60000.0, 11.0)
 check("tracking: the open position is registered as trade #1",
       gate.position["id"] == 1
       and abs(gate.position["qty"] - gate.paper_btc / (1.0 - gate.fee_rate)) < 1e-12)
@@ -294,7 +309,7 @@ gate.day_pnl = -0.4                    # more than 3% of the day's starting equi
 allowed, why = gate._entry_gate(0)
 check("risk gate: daily loss limit blocks new entries",
       allowed is False and "daily loss limit" in why)
-gate._act_on_signal("BUY", 60000.0, False, 10.2, 0.0, df_up, candle_ts=1)
+gate._act_on_signal("BUY", 60000.0, False, 11.0, 0.0, df_up, candle_ts=1)
 check("risk gate: a blocked BUY really opens no position", gate.trade_counter == 1)
 gate._act_on_signal("SELL", 61000.0, True, 0.0, gate.paper_btc, df_up, candle_ts=2)
 check("risk gate: an exit is NEVER blocked by the gates",
@@ -311,22 +326,23 @@ check("risk gate: cooldown right after a stop-out",
 check("risk gate: cooldown expires after the configured candles",
       gate._entry_gate(1000 + _cooldown_span)[0] is True)
 # -- Full take-profit cycle: tracking, journal, statistics ----------------------
-cyc = t.BinanceTestnetBot(dict(cfg10, order_size_quote=10.2))
+cyc = t.BinanceTestnetBot(dict(cfg10, order_size_quote=11.0))
 cyc.tg = t.TelegramNotifier("", "", cyc.log)
-cyc.place_buy(60000.0, 10.2, adx_now=28.4, rsi_now=55.2)
+cyc.place_buy(60000.0, 11.0, adx_now=28.4, rsi_now=55.2)
 check("tracking: entry context stored (ADX/RSI/reason)",
       cyc.position["entry_adx"] == 28.4 and cyc.position["entry_rsi"] == 55.2
       and "golden cross" in cyc.position["reason"])
 check("tracking: the entry keeps its TP/SL levels and planned R:R",
       cyc._tp_sl_levels(cyc.avg_entry_price)[0] > cyc.avg_entry_price
-      and cyc.position["planned_rr"] > 1.0)
+      and abs(cyc.position["planned_rr"] - cyc._net_rr()["rr"]) < 1e-9)
 tp_price = 60000.0 * (1.0 + cyc.cfg["take_profit_pct"] / 100.0)
 tp_hit = cyc._tp_sl_exit_reason(tp_price)
 check("TP level fires at +2.5%", tp_hit is not None and tp_hit.startswith("TAKE-PROFIT"))
 check("inside the bracket no TP/SL exit fires",
       cyc._tp_sl_exit_reason(60000.0 * 1.01) is None)
 sl_hit = cyc._tp_sl_exit_reason(60000.0 * (1.0 - cyc.cfg["stop_loss_pct"] / 100.0))
-check("SL level fires at -1.0%", sl_hit is not None and sl_hit.startswith("STOP-LOSS"))
+check(f"SL level fires at -{cyc.cfg['stop_loss_pct']:g}%",
+      sl_hit is not None and sl_hit.startswith("STOP-LOSS"))
 cyc.place_sell(tp_price, cyc.paper_btc, reason=tp_hit)
 check("journal: the closed trade is recorded with its reason + P/L",
       len(cyc.closed_trades) == 1
@@ -341,9 +357,9 @@ check("journal: the stats line reports W/L + P/L",
       "1W/0L" in cyc._stats_line("USDT") and "P/L" in cyc._stats_line("USDT"))
 
 # -- A stop-out: loss booked, losing streak counted -----------------------------
-slb = t.BinanceTestnetBot(dict(cfg10, order_size_quote=10.2))
+slb = t.BinanceTestnetBot(dict(cfg10, order_size_quote=11.0))
 slb.tg = t.TelegramNotifier("", "", slb.log)
-slb.place_buy(60000.0, 10.2)
+slb.place_buy(60000.0, 11.0)
 stop_price = 60000.0 * (1.0 - slb.cfg["stop_loss_pct"] / 100.0)
 slb.place_sell(stop_price, slb.paper_btc, reason=slb._tp_sl_exit_reason(stop_price))
 check("stop-out: loss booked and the losing streak counted",
@@ -362,9 +378,9 @@ check("dust: an exit below minNotional is refused instead of sent",
       abs(dust.paper_btc - dust_qty) < 1e-12 and dust.position is not None)
 
 # -- Safety: only the bot's own quantity is sold --------------------------------
-lim = t.BinanceTestnetBot(dict(cfg10, order_size_quote=10.2))
+lim = t.BinanceTestnetBot(dict(cfg10, order_size_quote=11.0))
 lim.tg = t.TelegramNotifier("", "", lim.log)
-lim.place_buy(60000.0, 10.2)
+lim.place_buy(60000.0, 11.0)
 lim.paper_btc += 0.25          # e.g. BTC that was already in the testnet wallet
 lim.place_sell(60000.0, lim.paper_btc)
 check("safety: only the bot's own quantity is sold (the rest stays put)",
@@ -1064,6 +1080,146 @@ check("asyncio scanner: blocking scans run in a worker thread (loop responsive)"
 check("asyncio scanner: run_async() is an awaitable coroutine",
       asyncio.iscoroutinefunction(t.MultiCoinScanner.run_async))
 
+
+
+# 5h) DCA (average down), the RSI entry filter and the armed trailing stop -----
+check("DCA trigger = 1.5% below the current average entry",
+      abs(t.dca_trigger_level(60000.0, 1.5) - 59100.0) < 1e-9)
+check("DCA trigger follows the average down after every add",
+      abs(t.dca_trigger_level(58500.0, 1.5) - 57622.5) < 1e-9)
+check("DCA trigger is inert when the feature is disabled (0%)",
+      t.dca_trigger_level(60000.0, 0.0) == 0.0)
+
+# plan_dca() is the shared decision function of the bot and the scanner.
+# The limits below mirror the real BTCUSDT market: minNotional 10, minQty 1e-4.
+_dca_base = dict(avg_entry=60000.0, qty=0.0002, quote_free=40.0,
+                 dca_drop_pct=1.5, dca_size_quote=10.0, dca_count=0,
+                 dca_max_entries=2, min_qty=0.0001, step=1e-8, min_cost=10.0,
+                 tp_pct=2.5, sl_pct=2.5, position_cost=12.0,
+                 max_position_quote=30.0, quote="USDT", base="BTC")
+_plan = t.plan_dca(60500.0, **_dca_base)
+check("DCA: no add while the price is still above the trigger",
+      _plan["ok"] is False and _plan["trigger"] is False
+      and "above the DCA level" in _plan["reason"])
+_plan = t.plan_dca(59000.0, **_dca_base)
+check("DCA: one add is offered 1.5% below the average entry",
+      _plan["ok"] is True and _plan["trigger"] is True
+      and _plan["dca_count"] == 1 and _plan["notional"] >= 10.0)
+check("DCA: the add lowers the average entry and grows the position",
+      _plan["new_entry"] < 60000.0 and _plan["new_qty"] > 0.0002
+      and _plan["new_cost"] > 12.0)
+check("DCA: TP/SL are re-anchored on the new average entry",
+      abs(_plan["new_tp"] - _plan["new_entry"] * 1.025) < 1e-9
+      and abs(_plan["new_sl"] - _plan["new_entry"] * 0.975) < 1e-9)
+_plan = t.plan_dca(58400.0, **_dca_base)          # -2.67% < the -2.5% stop
+check("DCA: never averages into a trade that already broke its stop",
+      _plan["ok"] is False and "stop-loss" in _plan["reason"])
+_plan = t.plan_dca(59000.0, **dict(_dca_base, dca_count=2))
+check("DCA: stops after DCA_MAX_ENTRIES adds",
+      _plan["ok"] is False and "already used" in _plan["reason"])
+_plan = t.plan_dca(59000.0, **dict(_dca_base, position_cost=30.0))
+check("DCA: refuses to pass DCA_MAX_POSITION_QUOTE",
+      _plan["ok"] is False and "DCA_MAX_POSITION_QUOTE" in _plan["reason"])
+_plan = t.plan_dca(59000.0, **dict(_dca_base, quote_free=4.0))
+check("DCA: refused when the free balance cannot cover minNotional",
+      _plan["ok"] is False and bool(_plan["reason"]))
+_plan = t.plan_dca(59000.0, **dict(_dca_base, dca_max_entries=0))
+check("DCA: disabled (DCA_MAX_ENTRIES=0) never offers an add",
+      _plan["ok"] is False and _plan["reason"] == "DCA is disabled")
+
+# RSI entry filter: explanatory string when blocked, "" when allowed/off.
+check("RSI filter: blown-off RSI above RSI_MAX_ENTRY blocks the entry",
+      "too overbought" in t.rsi_entry_block(78.0, 75.0, 0.0))
+check("RSI filter: deeply oversold RSI below RSI_MIN_ENTRY blocks the entry",
+      "too oversold" in t.rsi_entry_block(20.0, 75.0, 30.0))
+check("RSI filter: RSI inside the window allows the entry",
+      t.rsi_entry_block(55.0, 75.0, 30.0) == "")
+check("RSI filter: disabled (0/0) and unknown RSI never block",
+      t.rsi_entry_block(80.0, 0.0, 0.0) == ""
+      and t.rsi_entry_block(None, 75.0, 30.0) == "")
+_df_blow = df_up.copy()
+_df_blow["rsi"] = 82.0
+_sig, _rsi, _adx, _why = t.current_signal(_df_blow, rsi_max=75.0, rsi_min=0.0)
+check("current_signal: RSI_MAX_ENTRY overrides a golden-cross BUY",
+      _sig != "BUY" and _rsi == 82.0 and "RSI" in str(_why))
+
+# The trailing stop must not pre-empt the DCA: it only arms once the price
+# climbed TRAILING_ARM_PCT above the entry.
+check("trailing arm: not armed while the price never rose above the entry",
+      t.trailing_stop_armed(100.0, 99.0, 0.5) is False
+      and t.trailing_stop_armed(100.0, 100.4, 0.5) is False)
+check("trailing arm: armed once the peak is +0.5% above the entry",
+      t.trailing_stop_armed(100.0, 100.5, 0.5) is True)
+check("trailing stop: disarmed = no exit while the position is falling",
+      t.trailing_stop_hit(100.0, 99.0, 97.0, 1.0, 0.5) is False)
+check("trailing stop: armed = exit once the peak pullback hits trail%",
+      t.trailing_stop_hit(100.0, 103.0, 101.96, 1.0, 0.5) is True)
+check("trailing arm level is configurable (ARM 1.0% vs 0.5%)",
+      t.trailing_stop_hit(100.0, 100.9, 99.8, 1.0, 1.0) is False   # peak < +1.0%
+      and t.trailing_stop_hit(100.0, 101.0, 99.98, 1.0, 1.0) is True)
+
+# DCA wired into the single-symbol bot: plan -> apply -> re-plan on a new candle.
+dca_bot = t.BinanceTestnetBot(dict(cfg10, initial_balance_usdt=50.0,
+                                   dca_enabled=True, dca_drop_pct=1.5,
+                                   dca_size_quote=10.0, dca_max_entries=2,
+                                   dca_max_position_quote=30.0,
+                                   order_size_quote=10.0, symbol="BTC/USDT"))
+dca_bot.tg = t.TelegramNotifier("", "", dca_bot.log)
+dca_bot.place_buy(60000.0, 50.0)                    # a 10.00 USDT position
+check("DCA bot: position registered with the DCA fields",
+      bool(dca_bot.position) and dca_bot.position["dca_count"] == 0
+      and dca_bot.position["dca_spent"] == 0.0)
+check("DCA bot: no add while the price is still inside the bracket",
+      dca_bot.dca_plan(60500.0, 40.0)["ok"] is False)
+_add = dca_bot.dca_plan(59000.0, 40.0, candle_ts=1)
+check("DCA bot: the plan offers a 10 USDT add at the trigger",
+      _add["ok"] is True and _add["notional"] >= 10.0
+      and _add["new_entry"] < dca_bot.avg_entry_price)
+check("DCA bot: apply_dca averages down and consumes one entry",
+      dca_bot.apply_dca(59000.0, _add, candle_ts=1) is True
+      and dca_bot.position["dca_count"] == 1
+      and dca_bot.position["dca_spent"] > 0.0
+      and dca_bot.avg_entry_price < 60000.0
+      and abs(dca_bot.position["tp"] - dca_bot.avg_entry_price * 1.025) < 1e-9)
+check("DCA bot: one add per candle (the next plan on this candle is refused)",
+      dca_bot.dca_plan(58900.0, 30.0, candle_ts=1)["ok"] is False)
+_next = dca_bot.dca_plan(58900.0, 30.0, candle_ts=2)
+check("DCA bot: the next trigger sits 1.5% below the new average entry",
+      abs(_next["level"] - dca_bot.avg_entry_price * 0.985) < 1e-6)
+_msg = dca_bot._dca_message(dca_bot.position, 59000.0, 0.0001695, 10.0,
+                            60000.0, _add, "USDT", "BTC", demo=True)
+check("DCA bot: the Telegram card names the add, average and new bracket",
+      "DCA #1/2" in _msg and "Avg entry" in _msg
+      and "DCA_DROP_PERCENT=1.5%" in _msg and "TP:" in _msg)
+check("DCA bot: the stop-loss guard still wins after an add (58,000 < new stop)",
+      dca_bot.dca_plan(58000.0, 30.0, candle_ts=3)["ok"] is False
+      and "stop-loss" in dca_bot.dca_plan(58000.0, 30.0)["reason"])
+
+# 5i) Logging format safety. A bad %-spec inside a log call does not crash the
+#     bot (logging swallows it), but the line is silently LOST and a traceback
+#     is dumped on every tick - so statically validate every %-format message.
+_src_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "trading_bot.py")
+_src = open(_src_path, encoding="utf-8").read()
+_SPEC = re.compile(r"%(?:\([^)]*\))?[-+#0 ]*\d*(?:\.\d+)?[hlL]?"
+                   r"[diouxXeEfFgGcrsa%]")
+_bad_logs = []
+for _node in ast.walk(ast.parse(_src)):
+    if not isinstance(_node, ast.Call):
+        continue
+    if not (isinstance(_node.func, ast.Attribute)
+            and _node.func.attr in {"debug", "info", "warning", "error",
+                                    "critical"}):
+        continue
+    if len(_node.args) < 2 or not isinstance(_node.args[0], ast.Constant):
+        continue                      # no %-args -> logging does no formatting
+    _fmt = _node.args[0].value
+    if isinstance(_fmt, str) and "%" in _SPEC.sub("", _fmt):
+        _bad_logs.append((_node.lineno, _fmt))
+check("logging: every %-format log message uses only valid conversion specs",
+      not _bad_logs)
+check("logging: no legacy '%,.Nf' style format strings remain in the source",
+      not [ln for ln, _ in _bad_logs if "%," in _])
 
 
 print("\nSMOKE TEST:", "OK" if not failures else "FAILED -> " + ", ".join(failures))

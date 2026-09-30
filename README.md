@@ -1,13 +1,23 @@
-# Binance Spot Testnet Trading Bot (BTC/USDT)
+# Binance Spot Testnet Trading Bot (multi-coin scanner, DCA, trailing stop)
 
 A small, ready-to-run **paper-trading** bot for the **Binance Spot Testnet**.
 It trades **5-minute candles** using an **EMA(8, 21) crossover** strategy
 (BUY / SELL / HOLD) with an **ADX(14) trend filter** (entries only when
-ADX > 25, configurable) read from **completed candles only**, and logs
-**RSI(14)** as well. Every position is protected by an automatic
-**Take-Profit (+2.5%)** and **Stop-Loss (-1.0%)** hard limit, sized so that the
-order really passes the exchange's `minNotional` filter *after* lot rounding —
-and so that its stop-loss exit can still be sold.
+ADX > 25, configurable) read from **completed candles only**, plus an optional
+**RSI entry filter** (`RSI_MAX_ENTRY=75` refuses to chase a blow-off top).
+Every position is protected by an automatic **Take-Profit (+2.5%)** and
+**Stop-Loss (-2.5%)** hard limit, an *armed* **trailing stop** (it only starts
+after the price has risen `TRAILING_ARM_PCT=0.5%` above the entry, so it never
+pre-empts the risk rules on the way down), and an optional **DCA grid** that
+averages down `-1.5%` below the average entry instead of stopping out at once.
+Orders are sized so they really pass the exchange's `minNotional` filter
+*after* lot rounding — and so that their stop-loss exit can still be sold.
+
+The shipped configuration targets a **50 USDT** test account
+(`INITIAL_BALANCE_USDT=50`) trading **BTC, ETH, SOL and BNB** through the
+multi-coin scanner, with roughly 20% of the balance kept free for DCA adds and
+fees. Every action (entry, DCA add, take-profit, stop-out, trailing exit, risk
+pause) is announced on **Telegram**.
 
 > ⚠️ **No real money is ever at risk.** The exchange is forced into ccxt
 > sandbox/testnet mode, so every request goes only to
@@ -63,7 +73,18 @@ BINANCE_TESTNET_API_SECRET=your_testnet_secret_key
 
 All other settings (symbol, timeframe, EMA periods, ADX filter, TP/SL,
 sizing, risk caps, poll interval, ...) are already filled with sensible
-defaults — see the comments in `.env.example`.
+defaults — see the comments in `.env.example`. The blocks you will touch most:
+
+```
+STOP_LOSS_PCT=2.5       # hard stop (must sit BELOW DCA_DROP_PERCENT)
+TRAILING_STOP_PCT=1.0   # profit lock, armed only after TRAILING_ARM_PCT=0.5%
+DCA_ENABLED=true        # DCA_DROP_PERCENT=1.5, DCA_SIZE_QUOTE=10,
+                        # DCA_MAX_ENTRIES=2, DCA_MAX_POSITION_QUOTE=30
+RSI_MAX_ENTRY=75        # 0 = RSI entry filter off
+INITIAL_BALANCE_USDT=50.0
+SCANNER_SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT
+USE_ALL_BALANCE_PCT=80  # caps what may be invested; rest stays free for DCA
+```
 
 `.env` is the **single source of truth**: values in it always override stale
 variables inherited from your shell (a leftover `DEMO_MODE=true` or
@@ -82,11 +103,11 @@ python trading_bot.py
 You should see real-time logs like this:
 
 ```
-14:03:22 | INFO    | Sizing check: budget 10 USDT | minNotional 5.00 USDT | safe minimum account 10.121 USDT | free 10.2000 USDT (equity 10.20)
-14:03:22 | INFO    | Net reward/risk after costs: win +2.20% / loss -1.30% -> R:R 1.69 (break-even win rate 37.1%) | TP 2.5% | SL 1% | 0.30% per round trip
-14:03:37 | INFO    | price=59720.45 | EMA8=59801.12 EMA21=59900.34 | RSI14=49.23 | ADX14=27.14 (filter>25) | signal=HOLD (no crossover, closed candles) | position=flat | free=10.2000 USDT free=0.00000000 BTC | tp=n/a sl=n/a
-14:03:52 | INFO    | >> BUY order placed  id=1234567 status=closed qty=0.00017 @ 59,720.45 cost=10.1525 | TP: 61,213.46 (+2.5%) | SL: 59,123.25 (-1%) | lot bumped up to pass minNotional
-14:04:07 | INFO    | price=60540.10 | ... | signal=HOLD (no crossover, closed candles) | position=#1 LONG entry=59,720.45 uPnL=+1.37% | free=0.0000 USDT free=0.00016983 BTC | tp=61,213.46 sl=59,123.25
+14:03:22 | INFO    | Sizing check: budget 10 USDT | minNotional 10.00 USDT | safe minimum account 10.21 USDT | free 50.0000 USDT (equity 50.00)
+14:03:22 | INFO    | Net reward/risk after costs: win +2.20% / loss -1.80% -> R:R 1.22 (break-even win rate 45.0%) | TP 2.5% | SL 2.5% | 0.30% per round trip
+14:03:37 | INFO    | price=59720.45 | EMA8=59801.12 EMA21=59900.34 | RSI14=49.23 | ADX14=27.14 (filter>25) | signal=HOLD (no crossover, closed candles) | position=flat | free=50.0000 USDT free=0.00000000 BTC | tp=n/a sl=n/a
+14:03:52 | INFO    | >> BUY order placed  id=1234567 status=closed qty=0.00017 @ 59,720.45 cost=10.1525 | TP: 61,213.46 (+2.5%) | SL: 58,227.44 (-2.5%) | lot bumped up to pass minNotional
+14:04:07 | INFO    | price=60540.10 | ... | signal=HOLD (no crossover, closed candles) | position=#1 LONG entry=59,720.45 uPnL=+1.37% | free=39.8475 USDT free=0.00016983 BTC | tp=61,213.46 sl=58,227.44
 ```
 
 - **BUY** is logged and a market order is placed when EMA fast crosses **above**
@@ -97,9 +118,23 @@ You should see real-time logs like this:
 - **HOLD** means no usable crossover happened (the reason is always logged, e.g.
   "golden cross but ADX=21.4 <= 25 (no trend - entry filtered out)").
 - **TP / SL**: while a position is open the log (and Telegram) show the live
-  Take-Profit (`+2.5%`) and Stop-Loss (`-1.0%`) levels. The bot closes the
+  Take-Profit (`+2.5%`) and Stop-Loss (`-2.5%`) levels. The bot closes the
   position automatically as soon as the price hits either level, even in the
   middle of a candle, and reports which level fired.
+- **Trailing stop**: once the price has climbed `TRAILING_ARM_PCT` (0.5%)
+  above the entry, the exit trails `TRAILING_STOP_PCT` (1%) behind the running
+  peak — a pure profit lock that can never fire before the position actually
+  went up (so it does not pre-empt the DCA or the hard stop on the way down).
+- **DCA (average down)**: `-1.5%` below the *current average* entry the bot
+  adds `DCA_SIZE_QUOTE` (10 USDT) instead of being stopped out at once — at
+  most `DCA_MAX_ENTRIES=2` times, at most once per candle, never past
+  `DCA_MAX_POSITION_QUOTE=30`, and never once the hard stop is broken. TP and
+  trailing exits always win over a DCA add; afterwards the TP/SL bracket and
+  the next trigger move with the new average entry.
+- **RSI entry filter**: `RSI_MAX_ENTRY=75` / `RSI_MIN_ENTRY` refuse a *new* BUY
+  outside the configured window (exits and DCA adds are never gated). The
+  refusal reason is logged, e.g. `golden cross but RSI=78.2 > RSI_MAX_ENTRY=75
+  (too overbought to start a trade)`.
 - `position=#1 LONG entry=... uPnL=...` tracks the open trade — its number,
   entry price and unrealised P/L. Every closed trade is journaled with its
   reason, P/L, holding time and the running session statistics (also visible in
@@ -107,7 +142,7 @@ You should see real-time logs like this:
 - The bot only acts **once per candle** on indicator signals, so it does not
   spam orders while a signal stays active (TP/SL are checked on every poll).
 
-### Position sizing on a small (10 USDT) balance
+### Position sizing on a small (10–50 USDT) balance
 
 Binance rejects an order whose *rounded* value is below the symbol's
 `minNotional` — and it rejects a **sell** that would be worth less than that
@@ -141,13 +176,16 @@ You can watch the exact same loop with simulated price data before you have keys
 set `DEMO_MODE=true` inside `.env` and run `python trading_bot.py`.
 
 A random-walk price feed is generated locally and simulated BUY/SELL orders are
-logged with the `DEMO` prefix. The demo simulates the same sized account you are
-testing against on the real testnet — **10.00 USDT** by default
+logged with the `DEMO` prefix (DCA adds, trailing exits and the RSI filter work
+exactly as in live mode). The demo simulates the same sized account you are
+testing against on the real testnet — **50.00 USDT** by default
 (`INITIAL_BALANCE_USDT`), with `ORDER_SIZE_QUOTE=10` and a realistic **0.1%
 taker fee** (`FEE_RATE=0.001`) applied to paper fills, so leftover dust and
-residual balances behave like the live account. `python smoke_test.py` verifies
-this scenario (minNotional gate, lot-step bump, dust protection, fee residuals)
-without any network access.
+residual balances behave like the live account. `RUN_FOR_SECONDS=12` makes a
+demo run stop itself after N seconds (test-only; ignored in production, honoured
+by both the single-symbol loop and the scanner). `python smoke_test.py`
+verifies this scenario (minNotional gate, lot-step bump, dust protection, fee
+residuals) without any network access.
 
 ### Multi-coin / all-USDT-pairs scanner (optional, async)
 
@@ -167,14 +205,19 @@ What it does:
    to the high-volume ones via `SCAN_MIN_24H_QUOTE`, minus `SCAN_EXCLUDE`, capped
    at `SCAN_MAX_SYMBOLS`. You can force an explicit list with `SCANNER_SYMBOLS`.
 2. **Proportional position sizing.** The free balance is split into
-   `PORTFOLIO_PARTS` equal budgets (the reference video splits the account into
-   21 parts). On a $10 account each slot is floored to `PORTFOLIO_FLOOR_USDT` /
+   `PORTFOLIO_PARTS` equal budgets (5 parts of ~10 USDT on the shipped 50 USDT
+   account). On a $10 account each slot is floored to `PORTFOLIO_FLOOR_USDT` /
    minNotional, so it auto-degrades to one safe, exit-viable slot; on $50+ it
-   spreads across several properly-sized slots. `USE_ALL_BALANCE_PCT` reserves
-   cash for fees.
+   spreads across several properly-sized slots. `USE_ALL_BALANCE_PCT` (80%)
+   caps how much may be invested at once, so the remainder stays free for DCA
+   adds and fees instead of being fully invested.
 3. **Same risk rules, per pair.** Each open position gets its own hard
-   Take-Profit, Stop-Loss and optional Trailing-Stop (`TRAILING_STOP_PCT`), and
-   the EMA + ADX trend filter (`ADX_THRESHOLD`, default 25) gates every new entry.
+   Take-Profit, Stop-Loss, *armed* Trailing-Stop (`TRAILING_STOP_PCT` +
+   `TRAILING_ARM_PCT`) and its own DCA grid (`DCA_*`), while the EMA + ADX
+   trend filter (`ADX_THRESHOLD`, default 25) and the RSI filter
+   (`RSI_MAX_ENTRY`) gate every new entry. Exit priority per cycle:
+   take-profit → trailing stop → DCA add → stop-loss → EMA death cross (the
+   bracket is re-checked after a DCA add).
 4. **Non-blocking, parallel scanning.** Per-symbol price/candle fetches run in a
    thread pool, and the `--async` loop runs each full cycle in a worker thread,
    so the event loop stays responsive while the scanner crawls many pairs.
@@ -293,19 +336,26 @@ A smoke test ships with the project. It never touches the network and never
 places a real order. It covers:
 
 - sandbox routing (`testnet.binance.vision`);
-- EMA crossover signals, the ADX > 25 trend filter and **closed-candle** signals;
+- EMA crossover signals, the ADX > 25 trend filter, **closed-candle** signals
+  and the RSI entry filter (`RSI_MAX_ENTRY` / `RSI_MIN_ENTRY`);
 - net reward/risk maths after fees and slippage;
-- demo paper trading, fee residuals and the 10 USDT balance;
+- demo paper trading, fee residuals and the small (10 / 50 USDT) balances;
 - the exchange-minimum sizing rules: lot-step bump, `minNotional` refusal after
   rounding, dust-risk detection and the "safe minimum balance" helper;
+- DCA planning: trigger grid, max entries, per-coin cap, the broken-stop guard,
+  the minNotional-checked add, and the one-add-per-candle rule;
+- the *armed* trailing stop (it stays inert until the price rose
+  `TRAILING_ARM_PCT` above the entry, then trails the peak);
 - trade tracking + journal statistics (take-profit cycle, stop-out, streak);
 - the account risk gates (daily loss limit, losing streak, cooldown) and the
   guarantee that an exit is never blocked by them;
 - Telegram notifier behaviour (retries, background queue, disk spool, message
   content) and the fail-safe startup self-checks;
+- logging format safety (every `%-format` log message uses only valid
+  conversion specs, so no log line is ever silently swallowed);
 - the asyncio entry point (`run_async`) and clean cancellation;
 - the multi-coin scanner: dynamic `/USDT` symbol discovery, proportional
-  (21-part) position sizing from $10 to $50+, per-pair TP/SL + trailing stop,
+  position sizing from $10 to $50+, per-pair TP/SL + armed trailing stop + DCA,
   BNB fee-discount handling, and a non-blocking asyncio scanner loop.
 
 ```bash
@@ -327,6 +377,7 @@ python smoke_test.py     # all checks should print PASS
 ## 9. Disclaimer
 
 This is an educational project. Strategy parameters like EMA(8, 21) with an
-ADX(14) > 25 filter and a fixed +2.5% / -1.0% TP/SL are deliberately simple,
-and even on the testnet you should only trade amounts you are comfortable
-experimenting with. Always start with `DEMO_MODE=true`.
+ADX(14) > 25 filter, a fixed +2.5% / -2.5% TP/SL, a -1.5% DCA grid and a 1%
+trailing stop are deliberately simple, and even on the testnet you should only
+trade amounts you are comfortable experimenting with. Always start with
+`DEMO_MODE=true`.
