@@ -82,7 +82,8 @@ DCA_ENABLED=true        # DCA_DROP_PERCENT=1.5, DCA_SIZE_QUOTE=10,
                         # DCA_MAX_ENTRIES=2, DCA_MAX_POSITION_QUOTE=30
 RSI_MAX_ENTRY=75        # 0 = RSI entry filter off
 INITIAL_BALANCE_USDT=50.0
-SCANNER_SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT
+SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT   # multi-coin, one position each
+ORDER_SIZE_PER_COIN=true  # buy exactly ORDER_SIZE_QUOTE of EACH coin
 USE_ALL_BALANCE_PCT=80  # caps what may be invested; rest stays free for DCA
 ```
 
@@ -187,30 +188,49 @@ by both the single-symbol loop and the scanner). `python smoke_test.py`
 verifies this scenario (minNotional gate, lot-step bump, dust protection, fee
 residuals) without any network access.
 
-### Multi-coin / all-USDT-pairs scanner (optional, async)
+### Multi-coin portfolio (parallel) & all-USDT-pairs scanner
 
-The classic bot trades one `SYMBOL`. Turn the scanner on and it trades a whole
-portfolio of spot pairs at once:
+The classic bot trades one `SYMBOL`. List several coins in `SYMBOLS` and the bot
+becomes a parallel multi-coin portfolio — one independent position per coin:
+
+```
+# .env
+SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT
+ORDER_SIZE_PER_COIN=true   # buy exactly ORDER_SIZE_QUOTE of EACH coin
+ORDER_SIZE_QUOTE=50        # -> 50 USDT of BTC, 50 of ETH, ... (free balance caps)
+```
+
+Just run it — with 2+ coins the multi-coin portfolio is switched on
+automatically. For fully dynamic / all-pairs mode use `SCAN_ENABLED=true` or a
+CLI flag:
 
 ```bash
-# set SCAN_ENABLED=true in .env,  OR  pass a CLI flag:
+# dynamic discovery of every liquid /USDT pair:
 python trading_bot.py --scan          # sync loop
 python trading_bot.py --scan --async  # asyncio loop (worker threads keep it responsive)
 ```
 
 What it does:
 
-1. **Dynamic universe.** Each cycle it calls `load_markets()` and picks every
-   active SPOT pair quoted in `SCAN_QUOTE` (USDT by default), optionally dropped
-   to the high-volume ones via `SCAN_MIN_24H_QUOTE`, minus `SCAN_EXCLUDE`, capped
-   at `SCAN_MAX_SYMBOLS`. You can force an explicit list with `SCANNER_SYMBOLS`.
-2. **Proportional position sizing.** The free balance is split into
-   `PORTFOLIO_PARTS` equal budgets (5 parts of ~10 USDT on the shipped 50 USDT
-   account). On a $10 account each slot is floored to `PORTFOLIO_FLOOR_USDT` /
-   minNotional, so it auto-degrades to one safe, exit-viable slot; on $50+ it
-   spreads across several properly-sized slots. `USE_ALL_BALANCE_PCT` (80%)
-   caps how much may be invested at once, so the remainder stays free for DCA
-   adds and fees instead of being fully invested.
+1. **Coin universe.** A `SYMBOLS` list with 2+ coins (e.g.
+   `BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT`) is traded in parallel — the bot
+   enters *every* coin that shows an active BUY setup in the same cycle, each as
+   its own independent position. For fully dynamic mode (`SCAN_ENABLED=true` /
+   `--scan`) it instead calls `load_markets()` and picks every active SPOT pair
+   quoted in `SCAN_QUOTE` (USDT by default), optionally dropped to the
+   high-volume ones via `SCAN_MIN_24H_QUOTE`, minus `SCAN_EXCLUDE`, capped at
+   `SCAN_MAX_SYMBOLS` (the legacy `SCANNER_SYMBOLS` list is used when `SYMBOLS`
+   is empty).
+2. **Position sizing.** With `ORDER_SIZE_PER_COIN=true` (auto-on for a 2+ coin
+   `SYMBOLS` list) *every* entry spends exactly `ORDER_SIZE_QUOTE`, so
+   `ORDER_SIZE_QUOTE=50` buys 50 USDT of each coin — the free balance is the
+   only limit. Otherwise the free balance is split into `PORTFOLIO_PARTS` equal
+   budgets (5 parts of ~10 USDT on the shipped 50 USDT account). On a $10
+   account each slot is floored to `PORTFOLIO_FLOOR_USDT` / minNotional, so it
+   auto-degrades to one safe, exit-viable slot; on $50+ it spreads across
+   several properly-sized slots. `USE_ALL_BALANCE_PCT` (80%) caps how much may
+   be invested at once, so the remainder stays free for DCA adds and fees
+   instead of being fully invested.
 3. **Same risk rules, per pair.** Each open position gets its own hard
    Take-Profit, Stop-Loss, *armed* Trailing-Stop (`TRAILING_STOP_PCT` +
    `TRAILING_ARM_PCT`) and its own DCA grid (`DCA_*`), while the EMA + ADX
@@ -354,9 +374,11 @@ places a real order. It covers:
 - logging format safety (every `%-format` log message uses only valid
   conversion specs, so no log line is ever silently swallowed);
 - the asyncio entry point (`run_async`) and clean cancellation;
-- the multi-coin scanner: dynamic `/USDT` symbol discovery, proportional
-  position sizing from $10 to $50+, per-pair TP/SL + armed trailing stop + DCA,
-  BNB fee-discount handling, and a non-blocking asyncio scanner loop.
+- the multi-coin portfolio: parsing the `SYMBOLS` list, fixed per-coin sizing
+  (`ORDER_SIZE_PER_COIN`), parallel positions in several coins at once,
+  dynamic `/USDT` symbol discovery, proportional position sizing from $10 to
+  $50+, per-pair TP/SL + armed trailing stop + DCA, BNB fee-discount handling,
+  and a non-blocking asyncio scanner loop.
 
 ```bash
 python smoke_test.py     # all checks should print PASS

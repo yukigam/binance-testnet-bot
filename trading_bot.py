@@ -62,20 +62,27 @@ reported to Telegram.
 
 COIN LIST / MULTI-COIN SCANNING
 -------------------------------
-SCANNER_SYMBOLS (e.g. "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT" - plain
-"BTCUSDT,BTCUSDT" style names are accepted too) makes the bot poll that list
-one coin after another, every SCAN_POLL_SECONDS, and open a position in the
-first coin that shows an active BUY setup (EMA golden cross + ADX trend filter
-+ RSI filter), each with its own proportional budget and its own TP/SL/
-trailing stop. Empty SCANNER_SYMBOLS = discover every liquid /USDT pair.
+SYMBOLS (e.g. "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT" - a plain "BTCUSDT" or
+"BTC-USDT" name is accepted too) turns the bot into a multi-coin portfolio: 2+
+entries are traded in PARALLEL, one independent position per coin, so the bot
+can hold BUY positions in several coins at the same time (each coin gets its
+own entry, its own TP/SL and its own trailing stop). A single entry (or an
+empty list) keeps the classic single-symbol behaviour driven by SYMBOL.
+ORDER_SIZE_PER_COIN (auto-on when SYMBOLS lists 2+ coins) sizes EVERY entry at
+exactly ORDER_SIZE_QUOTE, so ORDER_SIZE_QUOTE=50 buys 50 USDT of each coin -
+bounded only by the free balance. Set it to false to go back to the
+proportional PORTFOLIO_PARTS split described below.
+SCANNER_SYMBOLS does the same but only when SCAN_ENABLED=true; a non-empty
+SYMBOLS wins over it. Empty list (both) = discover every liquid /USDT pair.
 
 POSITION SIZING (a 50 USDT test balance)
 ----------------------------------------
 The defaults are tuned for a 50.00 USDT testnet balance: ORDER_SIZE_QUOTE=10
-spends 10 USDT per entry (five slots), the multi-coin scanner splits the
-balance into PORTFOLIO_PARTS proportional slots that are floored to the
+spends 10 USDT per entry (five slots), the multi-coin scanner normally splits
+the balance into PORTFOLIO_PARTS proportional slots that are floored to the
 exchange minimum, and USE_ALL_BALANCE_PCT=80 keeps a ~10 USDT reserve for DCA
-adds and fees.
+adds and fees. With ORDER_SIZE_PER_COIN=true each coin is instead sized at
+exactly ORDER_SIZE_QUOTE (fixed per coin).
 A market order is only sent when the *rounded* order really passes the
 exchange's MIN_NOTIONAL filter: the bot floors the quantity to the lot step,
 bumps it up by one step when that flooring would fall below minNotional (only
@@ -209,12 +216,31 @@ def _mask_secret(value: str) -> str:
 
 def load_config() -> dict:
     """Collect all tunable settings from environment variables / .env file."""
+    # Multi-coin list: "SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT" (a plain "BTCUSDT"
+    # or "BTC-USDT" name is accepted too). An empty list keeps the classic
+    # single-symbol behaviour driven by SYMBOL below.
+    symbols = [normalize_symbol(part) for part in
+               os.getenv("SYMBOLS", "").split(",") if part.strip()]
+    # Per-coin fixed sizing: an explicit ORDER_SIZE_PER_COIN wins, otherwise it
+    # is auto-enabled as soon as SYMBOLS lists more than one coin (each entry
+    # then spends exactly ORDER_SIZE_QUOTE instead of a proportional slice).
+    _per_coin_raw = os.getenv("ORDER_SIZE_PER_COIN", "").strip().lower()
+    order_size_per_coin = ((_per_coin_raw in ("1", "true", "yes", "on"))
+                           if _per_coin_raw else len(symbols) > 1)
     return {
         # --- Binance Spot Testnet credentials -------------------------------
         "api_key": os.getenv("BINANCE_TESTNET_API_KEY", "").strip(),
         "api_secret": os.getenv("BINANCE_TESTNET_API_SECRET", "").strip(),
         # --- Market & strategy ----------------------------------------------
+        # Single-symbol mode (used when SYMBOLS is empty or holds one coin).
         "symbol": os.getenv("SYMBOL", "BTC/USDT").strip(),
+        # Multi-coin mode: the comma-separated SYMBOLS list, traded in parallel
+        # with one independent position per coin (2+ entries auto-enable the
+        # scanner in main()).
+        "symbols": symbols,
+        # true  -> every coin is sized at exactly ORDER_SIZE_QUOTE (fixed per
+        #          coin); false -> the proportional PORTFOLIO_PARTS split.
+        "order_size_per_coin": order_size_per_coin,
         # 5m frames are used: 5-minute candles (see README).
         "timeframe": os.getenv("TIMEFRAME", "5m").strip(),
         # Exponential Moving Average crossover (fast / slow), more responsive
@@ -2726,8 +2752,19 @@ class MultiCoinScanner:
         self.min_24h_quote = max(0.0, float(cfg.get("scan_min_24h_quote", 0.0) or 0.0))
         self.max_symbols = max(1, int(cfg.get("scan_max_symbols", 30) or 30))
         self.exclude = set((cfg.get("scan_exclude") or []))
-        self.explicit = [normalize_symbol(s, self.quote) for s in
-                         str(cfg.get("scanner_symbols", "")).split(",") if s.strip()]
+        # Explicit coin list. The multi-coin SYMBOLS list wins over the legacy
+        # SCANNER_SYMBOLS (both accept "BTCUSDT" / "BTC-USDT" spellings); with
+        # 2+ entries every coin is traded in PARALLEL with its own position.
+        _explicit_raw = [s for s in (cfg.get("symbols") or []) if str(s).strip()]
+        if not _explicit_raw:
+            _explicit_raw = [s.strip() for s in
+                             str(cfg.get("scanner_symbols", "")).split(",") if s.strip()]
+        self.explicit = [normalize_symbol(s, self.quote) for s in _explicit_raw]
+        # Per-coin fixed sizing: each entry gets exactly ORDER_SIZE_QUOTE
+        # (ORDER_SIZE_PER_COIN=true, auto-on when SYMBOLS lists 2+ coins)
+        # instead of one proportional PORTFOLIO_PARTS slice.
+        self.order_size_per_coin = bool(cfg.get("order_size_per_coin", False))
+        self.per_coin_quote = max(0.0, float(cfg.get("order_size_quote", 0.0) or 0.0))
         self.trailing_pct = max(0.0, float(cfg.get("trailing_stop_pct", 0.0) or 0.0))
         self.trailing_arm_pct = max(0.0, float(cfg.get("trailing_arm_pct", 0.5) or 0.0))
         # DCA / averaging down (same rules as the single-symbol bot; see
@@ -3179,7 +3216,8 @@ class MultiCoinScanner:
         """
         try:
             if not self.symbols:
-                self.log.warning("[scan] no symbols to scan - is SCANNER_SYMBOLS empty?")
+                self.log.warning("[scan] no symbols to scan - is SYMBOLS / "
+                                 "SCANNER_SYMBOLS empty?")
                 return
             quote_free = self.get_quote_balance()
             with self.lock:
@@ -3189,12 +3227,19 @@ class MultiCoinScanner:
             prop = compute_proportional_budget(
                 deploy, parts=self.parts, floor_usdt=self.floor_usdt)
             per_part = prop["per_part"]
-            self.log.info(
-                "[scan] free %s %s | deploy %s -> %d/%d part(s) @ %s %s each "
-                "(reserved %s by %d open)",
-                f"{quote_free:,.4f}", self.quote, f"{deploy:,.2f}",
-                prop["usable_parts"], prop["parts"], f"{per_part:,.4f}",
-                self.quote, f"{reserved:,.4f}", len(self.positions))
+            if self.order_size_per_coin:
+                self.log.info(
+                    "[scan] free %s %s | per-coin budget %s %s (fixed) | reserved "
+                    "%s by %d open",
+                    f"{quote_free:,.4f}", self.quote, f"{self.per_coin_quote:,.4f}",
+                    self.quote, f"{reserved:,.4f}", len(self.positions))
+            else:
+                self.log.info(
+                    "[scan] free %s %s | deploy %s -> %d/%d part(s) @ %s %s each "
+                    "(reserved %s by %d open)",
+                    f"{quote_free:,.4f}", self.quote, f"{deploy:,.2f}",
+                    prop["usable_parts"], prop["parts"], f"{per_part:,.4f}",
+                    self.quote, f"{reserved:,.4f}", len(self.positions))
 
             snapshots = self._fetch_snapshots(self.symbols)
             for symbol in self.symbols:
@@ -3245,16 +3290,21 @@ class MultiCoinScanner:
                     continue
                 if self.last_signal_candle.get(symbol) == candle_ts:
                     continue
-                # `deploy` is the share of the balance this cycle may invest
-                # (USE_ALL_BALANCE_PCT), `reserved` is what the open positions
-                # already hold - so the rest stays free for DCA adds and fees
-                # instead of being fully invested.
+                # Per-coin mode: every coin gets exactly ORDER_SIZE_QUOTE as long
+                # as the free balance covers it (each coin is a full, independent
+                # position and every coin is entered in the same cycle). Legacy
+                # mode: `deploy` (USE_ALL_BALANCE_PCT) and one proportional
+                # PORTFOLIO_PARTS slice, with `reserved` (the cost the open
+                # positions already hold) keeping room free for DCA adds.
                 available = max(0.0, quote_free - reserved)
-                budget = per_part if per_part > 0 else available
-                budget = min(budget, available, max(0.0, deploy - reserved))
+                if self.order_size_per_coin:
+                    budget = min(self.per_coin_quote, available)
+                else:
+                    budget = per_part if per_part > 0 else available
+                    budget = min(budget, available, max(0.0, deploy - reserved))
                 if budget < min_cost * (1.0 + self.buffer_pct / 100.0) and min_cost > 0:
                     self.log.info(
-                        "[scan] BUY skip %s: proportional part %s %s < minNotional %s",
+                        "[scan] BUY skip %s: budget %s %s < minNotional %s",
                         symbol, f"{budget:,.4f}", self.quote, f"{min_cost:,.2f}")
                     continue
                 self._place_buy(symbol, price, available, budget,
@@ -3412,7 +3462,10 @@ def main(use_async: bool = None) -> int:
     if use_async is None:
         use_async = any(arg in ("--async", "--asyncio") for arg in sys.argv[1:])
     cfg = load_config()
+    # A SYMBOLS list with 2+ coins turns the bot into the multi-coin portfolio
+    # automatically; SCAN_ENABLED / --scan keep the legacy dynamic discovery.
     use_scan = (cfg["scan_enabled"]
+                or len(cfg.get("symbols") or []) > 1
                 or any(arg in ("--scan", "--multi", "--all-pairs")
                        for arg in sys.argv[1:]))
     setup_logging(cfg["log_level"])
@@ -3479,16 +3532,28 @@ def main(use_async: bool = None) -> int:
         log.info("Mode     : %s (MULTI-COIN SCANNER)",
                  "LOCAL DEMO SIMULATION" if cfg["demo_mode"]
                  else "LIVE TESTNET (paper money @ testnet.binance.vision)")
-        log.info("Scanner  : %d proportional part(s) of the %s balance | quote %s | "
-                 "floor %.2f %s | BNB fee discount %.1f%% | trailing stop %.1f%%",
-                 cfg["portfolio_parts"], cfg["scan_quote"], cfg["scan_quote"],
-                 cfg["portfolio_floor_usdt"], cfg["scan_quote"],
-                 cfg["bnb_fee_discount_pct"], cfg["trailing_stop_pct"])
-        _list = [normalize_symbol(s, cfg["scan_quote"]) for s in
-                 str(cfg["scanner_symbols"]).split(",") if s.strip()]
-        log.info("Coins    : %s",
-                 ", ".join(_list) if _list
-                 else f"dynamic discovery of every liquid /{cfg['scan_quote']} pair")
+        _list = list(cfg.get("symbols") or [])
+        if not _list:
+            _list = [normalize_symbol(s, cfg["scan_quote"]) for s in
+                     str(cfg["scanner_symbols"]).split(",") if s.strip()]
+        if cfg.get("order_size_per_coin") and cfg["order_size_quote"] > 0:
+            log.info("Sizing   : FIXED %g %s per coin (ORDER_SIZE_PER_COIN) | "
+                     "quote %s | BNB fee discount %.1f%% | trailing stop %.1f%%",
+                     cfg["order_size_quote"], cfg["scan_quote"], cfg["scan_quote"],
+                     cfg["bnb_fee_discount_pct"], cfg["trailing_stop_pct"])
+        else:
+            log.info("Sizing   : proportional - %d part(s) of the %s balance | "
+                     "quote %s | floor %.2f %s | BNB fee discount %.1f%% | "
+                     "trailing stop %.1f%%",
+                     cfg["portfolio_parts"], cfg["scan_quote"], cfg["scan_quote"],
+                     cfg["portfolio_floor_usdt"], cfg["scan_quote"],
+                     cfg["bnb_fee_discount_pct"], cfg["trailing_stop_pct"])
+        if _list:
+            log.info("Coins    : %s (%d coin(s), one position each)",
+                     ", ".join(_list), len(_list))
+        else:
+            log.info("Coins    : dynamic discovery of every liquid /%s pair",
+                     cfg["scan_quote"])
         if cfg["dca_enabled"] and cfg["dca_max_entries"] > 0:
             log.info("DCA      : up to %d add(s) of %g %s per coin at -%g%% below "
                      "the average entry | per-coin cap %s",

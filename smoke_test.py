@@ -169,9 +169,33 @@ check("demo SELL returns USDT", bot.get_balances()["USDT"]["free"] > usdt)
 # NOTE: these edge cases are pinned to 10.00 USDT so the test stays valid
 # whatever balance the .env is tuned for.
 cfg10 = dict(t.load_config(), initial_balance_usdt=10.0)
-check("config order size = 10 USDT", abs(cfg10["order_size_quote"] - 10.0) < 1e-9)
-check("config initial balance = 50 USDT (the test balance)",
-      abs(t.load_config()["initial_balance_usdt"] - 50.0) < 1e-9)
+
+
+def _env_value(name, default):
+    """Read a value straight from the local .env (the single source of truth)."""
+    try:
+        for line in open(".env", encoding="utf-8").read().splitlines():
+            if line.strip().startswith(name + "="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return default
+
+
+# load_config() must mirror the .env file, whatever value it currently holds
+# (asserting a hard-coded 10 broke as soon as ORDER_SIZE_QUOTE was tuned up).
+check("config order size mirrors ORDER_SIZE_QUOTE in .env",
+      abs(cfg10["order_size_quote"]
+          - float(_env_value("ORDER_SIZE_QUOTE", "10"))) < 1e-9)
+check("config initial balance mirrors INITIAL_BALANCE_USDT in .env",
+      abs(t.load_config()["initial_balance_usdt"]
+          - float(_env_value("INITIAL_BALANCE_USDT", "50"))) < 1e-9)
+_cfg_env = t.load_config()
+check("config: SYMBOLS is parsed into a normalized list",
+      _cfg_env["symbols"] == [s.strip().upper() for s in
+                              _env_value("SYMBOLS", "").split(",") if s.strip()])
+check("config: 2+ SYMBOLS auto-enable per-coin fixed sizing",
+      (len(_cfg_env["symbols"]) > 1) == _cfg_env["order_size_per_coin"])
 
 bot10 = t.BinanceTestnetBot(cfg10)
 bot10.tg = t.TelegramNotifier("", "", bot10.log)  # stay chat-quiet
@@ -999,7 +1023,10 @@ check("discovery: EUR quote and non-/-USDT names are ignored",
       "BTC/EUR" not in _mk and "BTCUSDT" not in _mk)
 
 # 5e) MultiCoinScanner demo lifecycle: proportional BUY -> trailing/TP -> SELL.
+# Pin symbols=[] / order_size_per_coin=False so this case keeps exercising the
+# legacy proportional path regardless of the local .env.
 scan_cfg = dict(t.load_config(), demo_mode=True, initial_balance_usdt=50.0,
+                symbols=[], order_size_per_coin=False,
                 scanner_symbols="BTC/USDT,ETH/USDT,SOL/USDT", portfolio_parts=21,
                 portfolio_floor_usdt=10.0, trailing_stop_pct=2.0)
 scan = t.MultiCoinScanner(scan_cfg)
@@ -1028,6 +1055,28 @@ check("scanner close() is a harmless no-op for the demo scanner",
       scan.close() is None)
 check("scanner _scan_once() runs several full cycles without crashing",
       _exercise_scanner(scan))
+
+# 5e-2) Multi-coin SYMBOLS list + fixed per-coin sizing (new).
+multi_cfg = dict(t.load_config(), demo_mode=True, initial_balance_usdt=50.0,
+                 symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+                 order_size_per_coin=True, order_size_quote=10.0)
+multi = t.MultiCoinScanner(multi_cfg)
+multi.tg = t.TelegramNotifier("", "", multi.log)
+check("multi-coin: SYMBOLS drives the scanned universe",
+      set(multi.symbols) == {"BTC/USDT", "ETH/USDT", "SOL/USDT"})
+check("multi-coin: per-coin sizing on and pinned to ORDER_SIZE_QUOTE",
+      multi.order_size_per_coin is True and abs(multi.per_coin_quote - 10.0) < 1e-9)
+multi._place_buy("BTC/USDT", 60000.0, multi.paper_usdt, multi.per_coin_quote,
+                 adx_now=30.0)
+multi._place_buy("ETH/USDT", 3000.0, multi.paper_usdt, multi.per_coin_quote,
+                 adx_now=30.0)
+check("multi-coin: two coins hold independent positions at the same time",
+      set(multi.positions) == {"BTC/USDT", "ETH/USDT"})
+check("multi-coin: every entry spent the fixed ORDER_SIZE_QUOTE (50 -> ~30 left)",
+      abs(multi.paper_usdt - 30.0) < 0.2)
+check("multi-coin: SYMBOLS wins over the legacy SCANNER_SYMBOLS",
+      t.MultiCoinScanner(dict(multi_cfg, scanner_symbols="XRP/USDT")).explicit
+      == ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
 
 # 5f) Single-symbol bot: the same trailing-stop rule now protects its positions.
 trail_bot = t.BinanceTestnetBot(dict(cfg10, order_size_quote=10.2, trailing_stop_pct=2.0))
